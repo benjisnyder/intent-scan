@@ -1,0 +1,20 @@
+{
+  "name": "@otent/intent-scan",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Surface a project's durable AI intent (perspectives, canon, knowledge) from where it already lives, and compile it into a portable .intent/ folder. Local-first, nothing uploaded.",
+  "bin": {
+    "intent-scan": "src/scan.mjs"
+  },
+  "files": [
+    "src",
+    "TESTERS.md",
+    "README.md"
+  ],
+  "scripts": {
+    "scan": "node src/scan.mjs"
+  },
+  "optionalDependencies": {
+    "@anthropic-ai/sdk": "^0.104.2"
+  }
+}
