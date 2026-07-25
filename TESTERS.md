@@ -15,7 +15,7 @@ From the root of a project you have built with Claude Code (the folder where you
 run Claude):
 
 ```sh
-npx @otent/intent-scan .
+npx github:benjisnyder/intent-scan .
 ```
 
 It asks for consent, then opens an HTML report in your browser.
@@ -30,9 +30,9 @@ It asks for consent, then opens an HTML report in your browser.
 ## Options
 
 ```sh
-npx @otent/intent-scan .            # local, deterministic, nothing leaves your machine
-npx @otent/intent-scan . --llm      # better summaries, uses your ANTHROPIC_API_KEY
-npx @otent/intent-scan . --commit   # also place the .intent/ folder in your repo
+npx github:benjisnyder/intent-scan .            # local, deterministic, nothing leaves your machine
+npx github:benjisnyder/intent-scan . --llm      # better summaries, uses your ANTHROPIC_API_KEY
+npx github:benjisnyder/intent-scan . --commit   # also place the .intent/ folder in your repo
 ```
 
 By default the report and `.intent/` folder are written under `~/.otent/scans/`,
