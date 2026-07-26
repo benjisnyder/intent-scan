@@ -697,6 +697,14 @@ function writeReport(model) {
     attn.push(`<div class="ab info"><h4>${gaps.length} area${gaps.length > 1 ? "s" : ""} with notes but no codified knowledge</h4><p class="why">Plenty of working notes here, but nothing promoted to durable knowledge yet. Candidates to compile into a perspective.</p><ul class="mini">${gaps.map((g) => `<li>${esc(g)}</li>`).join("")}</ul></div>`);
   }
 
+  // Order adapts to size. Large projects: overview + graph on top, then the big
+  // card list (burying the graph under 130 cards reads badly). Small projects:
+  // lead with the few memories so the meta doesn't drown them.
+  const stripHtml = small ? `<div class="strip">${ins.surfaced} surfaced · ${ins.durable} worth keeping · ${plural(ins.subjectsOut, "area")}${model.relationshipCount ? ` · ${model.relationshipCount} connected` : ""}${ins.staleCount ? ` · ${ins.staleCount} stale` : ""}</div>` : "";
+  const byAreaSection = `<div class="section-title">The intent, by area</div>${searchHtml}${subjectSections}`;
+  const analysisSection = `${small ? "" : `<div class="section-title">What intent-scan did</div><div class="did">${did}</div>`}${graphHtml}${(model.timeline || []).length >= 3 ? timelineHtml : ""}<div class="section-title">What these are, and why they matter</div><div class="legend">${legend}</div>${attn.length ? `<div class="section-title">Worth your attention</div><div class="attn">${attn.join("")}</div>` : ""}`;
+  const bodyMain = small ? `${byAreaSection}<hr class="divider">${analysisSection}` : `${analysisSection}<hr class="divider">${byAreaSection}`;
+
   const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Intent · ${esc(model.project)}</title>
 <style>
@@ -791,20 +799,8 @@ code{font-family:ui-monospace,Menlo,monospace;background:#f0ede6;padding:1px 5px
 <h1>${esc(model.project)}</h1>
 <div class="sub">Your project's AI intent, made visible.</div>
 <p class="intro">As you built <b>${esc(model.project)}</b> with AI, it quietly accumulated <b>${ins.surfaced}</b> pieces of "intent": decisions you made, rules you set, and knowledge you taught it. Almost none of it was visible. It lived in Claude Code's local memory, not your repo. Below is what was there, each item cited to the exact file it came from. Click any tile to read the full note.</p>
-<div class="strip">${ins.surfaced} surfaced · ${ins.durable} worth keeping · ${plural(ins.subjectsOut, "area")}${model.relationshipCount ? ` · ${model.relationshipCount} connected` : ""}${ins.staleCount ? ` · ${ins.staleCount} stale` : ""}</div>
-
-<div class="section-title">The intent, by area</div>
-${searchHtml}
-${subjectSections}
-
-<hr class="divider">
-
-${small ? "" : `<div class="section-title">What intent-scan did</div><div class="did">${did}</div>`}
-${graphHtml}
-${(model.timeline || []).length >= 3 ? timelineHtml : ""}
-<div class="section-title">What these are, and why they matter</div>
-<div class="legend">${legend}</div>
-${attn.length ? `<div class="section-title">Worth your attention</div><div class="attn">${attn.join("")}</div>` : ""}
+${stripHtml}
+${bodyMain}
 
 <footer>
 Every item above is cited to the source file it came from, so nothing is invented. Pass: <b>${esc(model.mode)}</b>${ranLLM ? "" : " (run with <code>--llm</code> for sharper summaries and a conflict scan)"}. Compiled into a portable <code>.intent/</code> folder plus a generated <code>projected/CLAUDE.md</code>, so any tool can read the same intent. Everything stayed on your machine.
