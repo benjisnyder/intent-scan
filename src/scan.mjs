@@ -100,24 +100,43 @@ function classifyKind(name) {
   return "perspective";
 }
 
-const SUBJECT_RULES = [
-  [/(route3d|track-?3d|procedural-3d|route-rendering|first-person|fpv|camera|iso-color|player-skin|track-view|track-baseline|3d)/, "3D & Track Rendering"],
-  [/(auto-train|workout|plan-completion|text-workout|just-ride|laps|hr-based|hr-fit|erg|complication)/, "Auto Train & Workouts"],
-  [/(group-racing|group-race|presence|world-live|cave-crew|challenges|multiplayer|race-room|virtual-shifting|gearing)/, "Multiplayer & Racing"],
-  [/(pricing|feature-access|paywall|tier|duplicate.signup)/, "Pricing & Access"],
-  [/(^ios|android|desktop|windows|linux|mobile|native-auth|expo|webview)/, "Platforms & Builds"],
-  [/(garmin|strava|intervals|integration|import|rich-external|webhook|token-auth|ble|device|sensor|trainer|cadence|qdomyos|reconnect)/, "Devices & Integrations"],
-  [/(physiolog|adaptive-training|fitness-streak|nutrition|fueling|route-physics|training-status|periodization|bike-mass)/, "Training Science"],
-  [/(architecture|data-model|ui-patterns|routes-and-maps|blog-system|mini-apps|home-dashboard|diagnostic|admin-analytics|player-system|history-hot-cold)/, "Architecture & Foundations"],
-  [/(^ci-|^test-|vitest|build-commands|dev.environment|construction-time)/, "Dev & CI"],
-];
+function titleCase(s) {
+  return s.replace(/(^|\s)\w/g, (m) => m.toUpperCase());
+}
 
-function subjectOf(name) {
-  const n = name.toLowerCase();
-  if (/^feedback_/.test(n) || n === "security-rules.md") return "Canon (pinned rules)";
-  if (/^reference_/.test(n)) return "Reference";
-  for (const [re, label] of SUBJECT_RULES) if (re.test(n)) return label;
-  return "Other";
+// Project-agnostic subject clustering: group files by the meaningful filename
+// tokens they share, so this works on any codebase, not just one domain.
+const SUBJECT_STOP = new Set([
+  "feedback", "reference", "plan", "plans", "status", "review", "fix", "fixes",
+  "notes", "backlog", "followup", "investigation", "system", "app", "the", "and",
+  "for", "with", "new", "old", "phase", "v1", "v2", "v3", "setup", "support",
+  "project", "not", "using", "based", "guide", "core", "main", "redesign",
+  "pivot", "master", "inventory", "hardening", "cleanup", "revamp", "refactor",
+]);
+
+function subjectTokens(name) {
+  return name
+    .replace(/\.md$/, "")
+    .toLowerCase()
+    .split(/[-_]+/)
+    .filter((t) => t.length > 2 && !SUBJECT_STOP.has(t) && !/^\d+$/.test(t));
+}
+
+// Two-pass: count meaningful tokens across the project, then label each file
+// by the most salient token it shares with others. Canon and reference get
+// stable homes so pinned rules don't scatter.
+function assignSubjects(artifacts) {
+  const clusterable = artifacts.filter((a) => a.kind !== "canon" && a.kind !== "reference");
+  const freq = {};
+  for (const a of clusterable) for (const t of new Set(subjectTokens(a.name))) freq[t] = (freq[t] || 0) + 1;
+  for (const a of artifacts) {
+    if (a.kind === "canon") { a.subject = "Rules & Conventions"; continue; }
+    if (a.kind === "reference") { a.subject = "Reference"; continue; }
+    const ts = subjectTokens(a.name)
+      .filter((t) => (freq[t] || 0) >= 2)
+      .sort((x, y) => freq[y] - freq[x] || y.length - x.length);
+    a.subject = ts.length ? titleCase(ts[0]) : "Other";
+  }
 }
 
 // ---------- read sources ----------
@@ -141,7 +160,7 @@ function readMemory() {
         title: idx.title || data.name || titleFromName(name),
         summary: idx.hook || data.description || firstMeaningfulLine(body) || "(no summary found)",
         kind: data.type === "feedback" ? "canon" : data.type === "reference" ? "reference" : classifyKind(name),
-        subject: subjectOf(name),
+        subject: "",
         confidence: "observed",
         source: { tool: "claude", kind: "memory", path: full },
         ageDays,
@@ -430,12 +449,14 @@ function writeReport(model) {
     .map(([k, [name, what, why]]) => `<div class="leg"><div class="leg-h">${badge(k)}<b>${name}</b><span class="leg-n">${kinds[k] || 0}</span></div><div class="leg-what">${what}</div><div class="leg-why">${why}</div></div>`)
     .join("");
 
+  const refCount = kinds.reference || 0;
+  const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
   const didCard = (n, label, sub) => `<div class="did-card"><b>${n}</b><div class="did-l">${label}</div><div class="did-s">${sub}</div></div>`;
   const did = [
-    didCard(ins.surfaced, "surfaced", "pieces of intent that were invisible, living in Claude's local memory, not your repo"),
-    didCard(`${ins.durable} <span class="slash">kept</span> / ${ins.transient}`, "sorted", "durable knowledge and decisions separated from transient working notes"),
-    didCard(`${model.counts.total} <span class="slash">into</span> ${ins.subjectsOut}`, "organized", "scattered files grouped into clear subject areas"),
-    didCard(flagged, "flagged", "things worth a look: stale intent, conflicts, and cleanup opportunities (below)"),
+    didCard(ins.surfaced, "surfaced", "pieces of intent that were invisible, living in Claude's local memory, not in your repo."),
+    didCard(ins.durable, "worth keeping", `durable knowledge and decisions. ${plural(ins.transient, "transient note")} set aside${refCount ? `, ${plural(refCount, "reference")} kept` : ""}.`),
+    didCard(ins.subjectsOut, ins.subjectsOut === 1 ? "area" : "areas", `${plural(model.counts.total, "scattered file")} organized into subject areas.`),
+    didCard(flagged, "flagged", "worth a look: stale intent, conflicts, and cleanup opportunities (below)."),
   ].join("");
 
   const attn = [];
@@ -593,6 +614,8 @@ async function main() {
     console.log("  Nothing to surface here yet.\n");
     return;
   }
+
+  assignSubjects(artifacts); // deterministic clustering; the --llm pass refines it
 
   let conflicts = [];
   if (USE_LLM) {
