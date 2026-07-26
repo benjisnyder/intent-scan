@@ -19,6 +19,7 @@ const args = process.argv.slice(2);
 const USE_LLM = args.includes("--llm");
 const AUTO_YES = args.includes("--yes") || args.includes("-y");
 const DO_COMMIT = args.includes("--commit");
+const REDACT = args.includes("--redact");
 const projectPath = path.resolve(args.find((a) => !a.startsWith("--")) || process.cwd());
 const projectName = path.basename(projectPath);
 const slug = (s) =>
@@ -398,6 +399,38 @@ function writeProjection(model) {
   fs.writeFileSync(path.join(outDir, "projected", "CLAUDE.md"), md);
 }
 
+// Likely-secret detection. Over-flags rather than under-flags: it's a safety
+// warning, and --redact masks the values for a shareable copy.
+const SECRET_PATTERNS = [
+  { re: /-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----/g, mask: () => "[REDACTED PRIVATE KEY]" },
+  { re: /sk-ant-[A-Za-z0-9_-]{15,}/g, mask: (m) => m.slice(0, 10) + "…[REDACTED]" },
+  { re: /github_pat_[A-Za-z0-9_]{20,}/g, mask: () => "github_pat_…[REDACTED]" },
+  { re: /gh[posru]_[A-Za-z0-9]{20,}/g, mask: (m) => m.slice(0, 4) + "…[REDACTED]" },
+  { re: /AKIA[0-9A-Z]{16}/g, mask: () => "AKIA…[REDACTED]" },
+  { re: /AIza[0-9A-Za-z_-]{30,}/g, mask: () => "AIza…[REDACTED]" },
+  { re: /xox[baprs]-[A-Za-z0-9-]{10,}/g, mask: (m) => m.slice(0, 5) + "…[REDACTED]" },
+  { re: /eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{5,}/g, mask: () => "[REDACTED JWT]" },
+  { re: /sk-[A-Za-z0-9]{24,}/g, mask: (m) => m.slice(0, 3) + "…[REDACTED]" },
+  { re: /\b([a-z][a-z0-9+.-]*):\/\/([^\s:@/]+):([^\s@/]+)@/g, mask: (_m, s) => s + "://***:***@" },
+  { re: /\b(password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)\b(\s*[:=]\s*["'`]?)([^\s"'`,;]{6,})/gi, mask: (_m, k, sep) => k + sep + "••••[REDACTED]" },
+];
+
+function detectSecrets(text) {
+  const types = new Set();
+  let count = 0;
+  for (const p of SECRET_PATTERNS) {
+    const m = (text || "").match(p.re);
+    if (m) { count += m.length; types.add(p.re.source.slice(0, 14)); }
+  }
+  return { count, types };
+}
+
+function redactText(text) {
+  let out = text || "";
+  for (const p of SECRET_PATTERNS) out = out.replace(p.re, p.mask);
+  return out;
+}
+
 function snippetAround(body, linkText) {
   const needle = "[[" + linkText + "]]";
   const i = (body || "").indexOf(needle);
@@ -627,7 +660,7 @@ function writeReport(model) {
   const card = (a) => {
     const rels = relChips(a, false);
     const dq = esc((a.title + " " + a.summary + " " + a.subject + " " + a.kind).toLowerCase());
-    return `<div class="card" id="a-${esc(a.id)}" data-q="${dq}" onclick="openModal('${esc(a.id)}')"><div class="card-h">${badge(a.kind)}<span class="title">${esc(a.title)}</span>${a.stale ? `<span class="stale">stale ${a.ageDays}d</span>` : ""}</div><div class="summary">${esc(a.summary)}</div>${rels ? `<div class="rels"><span class="rl">Related:</span> ${rels}</div>` : ""}</div>`;
+    return `<div class="card" id="a-${esc(a.id)}" data-q="${dq}" onclick="openModal('${esc(a.id)}')"><div class="card-h">${badge(a.kind)}<span class="title">${esc(a.title)}</span>${a.stale ? `<span class="stale">stale ${a.ageDays}d</span>` : ""}${a.hasSecret ? `<span class="secbadge">secret</span>` : ""}</div><div class="summary">${esc(a.summary)}</div>${rels ? `<div class="rels"><span class="rl">Related:</span> ${rels}</div>` : ""}</div>`;
   };
   const connRow = (r) => `<div class="conn" onclick="openModal('${r.id}')"><div class="conn-t">${esc(idTitle[r.id] || r.id)}</div>${r.snippet ? `<div class="conn-s">${esc(r.snippet)}</div>` : ""}</div>`;
   const connections = (a) => {
@@ -642,7 +675,7 @@ function writeReport(model) {
     return "";
   };
   const modalSrc = (a) => {
-    return `<div class="msrc" id="src-${esc(a.id)}"><div class="m-head">${badge(a.kind)}<h2>${esc(a.title)}</h2></div><div class="m-meta">${esc(a.subject)} · ${esc(path.basename(a.source.path))}${a.stale ? ` · stale ${a.ageDays}d` : ""}</div><div class="m-sum">${esc(a.summary)}</div>${connections(a)}<div class="m-src-title">Source</div><div class="md">${mdLite(a.body || "")}${a.bodyTruncated ? '<p class="trunc">… truncated</p>' : ""}</div></div>`;
+    return `<div class="msrc" id="src-${esc(a.id)}"><div class="m-head">${badge(a.kind)}<h2>${esc(a.title)}</h2>${a.hasSecret ? `<span class="secbadge">secret</span>` : ""}</div><div class="m-meta">${esc(a.subject)} · ${esc(path.basename(a.source.path))}${a.stale ? ` · stale ${a.ageDays}d` : ""}</div><div class="m-sum">${esc(a.summary)}</div>${connections(a)}<div class="m-src-title">Source</div><div class="md">${mdLite(a.body || "")}${a.bodyTruncated ? '<p class="trunc">… truncated</p>' : ""}</div></div>`;
   };
   const modalSrcs = model.artifacts.map(modalSrc).join("");
   const graph = computeGraphLayout(model.artifacts);
@@ -704,6 +737,11 @@ function writeReport(model) {
   const byAreaSection = `<div class="section-title">The intent, by area</div>${searchHtml}${subjectSections}`;
   const analysisSection = `${small ? "" : `<div class="section-title">What intent-scan did</div><div class="did">${did}</div>`}${graphHtml}${(model.timeline || []).length >= 3 ? timelineHtml : ""}<div class="section-title">What these are, and why they matter</div><div class="legend">${legend}</div>${attn.length ? `<div class="section-title">Worth your attention</div><div class="attn">${attn.join("")}</div>` : ""}`;
   const bodyMain = small ? `${byAreaSection}<hr class="divider">${analysisSection}` : `${analysisSection}<hr class="divider">${byAreaSection}`;
+  const secretBanner = model.redacted
+    ? `<div class="secnote">Secrets redacted for sharing. Passwords, keys, and tokens have been masked in this copy.</div>`
+    : model.secretCount
+      ? `<div class="secwarn"><b>${model.secretCount} note${model.secretCount > 1 ? "s" : ""} contain${model.secretCount > 1 ? "" : "s"} likely credentials</b> (passwords, API keys, tokens). This report is on your machine, but do not share it as-is. Re-run with <code>--redact</code> for a masked, shareable copy.</div>`
+      : "";
 
   const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Intent · ${esc(model.project)}</title>
@@ -716,6 +754,10 @@ h1{font-size:30px;margin:0 0 6px;font-weight:660;letter-spacing:-0.01em}
 .intro{font-size:16px;color:#333;max-width:70ch;margin:0 0 8px}
 .intro b{color:#111}
 .strip{font-size:14px;color:#666;margin:2px 0 6px}
+.secwarn{background:#fbeeea;border:1px solid #e6c3b6;border-radius:10px;padding:12px 16px;margin:16px 0;font-size:14px;color:#7a3b28}
+.secwarn b{color:#7a3b28}
+.secnote{background:#eef2f7;border:1px solid #d5dfeb;border-radius:10px;padding:10px 16px;margin:16px 0;font-size:13.5px;color:#3a5d88}
+.secbadge{font-size:11px;font-weight:600;padding:1px 7px;border-radius:5px;text-transform:uppercase;letter-spacing:.03em;background:#f4d9cf;color:#8a3b22}
 .section-title{font-size:13px;font-weight:680;text-transform:uppercase;letter-spacing:.06em;color:var(--accent);margin:40px 0 14px}
 .did{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}
 .did-card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
@@ -799,6 +841,7 @@ code{font-family:ui-monospace,Menlo,monospace;background:#f0ede6;padding:1px 5px
 <h1>${esc(model.project)}</h1>
 <div class="sub">Your project's AI intent, made visible.</div>
 <p class="intro">As you built <b>${esc(model.project)}</b> with AI, it quietly accumulated <b>${ins.surfaced}</b> pieces of "intent": decisions you made, rules you set, and knowledge you taught it. Almost none of it was visible. It lived in Claude Code's local memory, not your repo. Below is what was there, each item cited to the exact file it came from. Click any tile to read the full note.</p>
+${secretBanner}
 ${stripHtml}
 ${bodyMain}
 
@@ -890,6 +933,15 @@ async function main() {
     return;
   }
 
+  // Flag likely secrets sitting in the notes; redact them when asked.
+  let secretCount = 0;
+  for (const a of artifacts) {
+    const found = detectSecrets((a.body || "") + "\n" + (a.summary || ""));
+    a.hasSecret = found.count > 0;
+    if (a.hasSecret) secretCount++;
+    if (REDACT) { a.body = redactText(a.body || ""); a.summary = redactText(a.summary || ""); }
+  }
+
   assignSubjects(artifacts); // deterministic clustering; the --llm pass refines it
   let relationshipMode = "links";
   let relationshipCount = resolveRelationships(artifacts);
@@ -922,6 +974,8 @@ async function main() {
     conflicts,
     relationshipCount,
     relationshipMode,
+    secretCount,
+    redacted: REDACT,
     timeline: computeTimeline(artifacts),
     repoGuidance,
     artifacts,
@@ -939,6 +993,7 @@ async function main() {
   console.log(`  ${model.counts.total} pieces of AI intent this project accumulated invisibly, now surfaced:`);
   console.log(`  ${k.perspective || 0} perspectives · ${k.canon || 0} canon (pinned decisions) · ${k.plan || 0} plans · ${new Set(artifacts.map((a) => a.subject)).size} subjects`);
   console.log(`  Compiled into a portable .intent/ folder, every item cited to its source. Yours, local, nothing uploaded.`);
+  if (secretCount) console.log(`\n  ⚠ ${secretCount} note${secretCount > 1 ? "s" : ""} contain${secretCount > 1 ? "" : "s"} likely credentials (passwords, keys).${REDACT ? " Redacted in this run." : " Add --redact before sharing the report."}`);
   console.log(`\n  Today this is a one-shot snapshot. The product keeps it in sync as you work,`);
   console.log(`  lets you curate it (promote, pin, merge, retire), and projects it into your tools.`);
 

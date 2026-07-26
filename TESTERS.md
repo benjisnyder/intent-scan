@@ -33,7 +33,12 @@ It asks for consent, then opens an HTML report in your browser.
 npx github:benjisnyder/intent-scan .            # local, deterministic, nothing leaves your machine
 npx github:benjisnyder/intent-scan . --llm      # better summaries, uses your ANTHROPIC_API_KEY
 npx github:benjisnyder/intent-scan . --commit   # also place the .intent/ folder in your repo
+npx github:benjisnyder/intent-scan . --redact   # mask passwords/keys, for a report you can share
 ```
+
+Heads up: your notes can contain real credentials (a password or API key you
+told the AI once). The report flags those and, on any project, `--redact` masks
+them so the report is safe to send back.
 
 By default the report and `.intent/` folder are written under `~/.otent/scans/`,
 not into your repo, so nothing is touched unless you pass `--commit`.
