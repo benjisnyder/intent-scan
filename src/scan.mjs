@@ -429,6 +429,44 @@ function resolveRelationships(artifacts) {
   return edges;
 }
 
+// Fallback for projects whose notes don't cross-reference each other: connect
+// notes by the meaningful words they share in their names (rarer words weigh
+// more), capped to each note's few strongest links so it stays a clean map.
+function assignTopicalRelationships(artifacts) {
+  const toks = new Map(), freq = {};
+  for (const a of artifacts) {
+    const t = new Set(subjectTokens(a.name));
+    toks.set(a.id, t);
+    for (const x of t) freq[x] = (freq[x] || 0) + 1;
+  }
+  const n = artifacts.length;
+  const cap = Math.max(4, Math.round(n * 0.4)); // ignore near-ubiquitous words
+  const byNode = artifacts.map(() => []);
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const A = toks.get(artifacts[i].id), B = toks.get(artifacts[j].id);
+      let w = 0;
+      for (const x of A) if (B.has(x) && freq[x] >= 2 && freq[x] <= cap) w += 1 / Math.log2(freq[x] + 1);
+      if (w > 0) { byNode[i].push([j, w]); byNode[j].push([i, w]); }
+    }
+  }
+  for (const a of artifacts) { a.related = []; a.refs = []; a.refBy = []; }
+  const K = 4, eset = new Set();
+  let edges = 0;
+  byNode.forEach((arr, i) => {
+    arr.sort((a, b) => b[1] - a[1]);
+    for (const [j] of arr.slice(0, K)) {
+      const key = Math.min(i, j) + "|" + Math.max(i, j);
+      if (eset.has(key)) continue;
+      eset.add(key);
+      edges++;
+      if (!artifacts[i].related.includes(artifacts[j].id)) artifacts[i].related.push(artifacts[j].id);
+      if (!artifacts[j].related.includes(artifacts[i].id)) artifacts[j].related.push(artifacts[i].id);
+    }
+  });
+  return edges;
+}
+
 function computeTimeline(artifacts) {
   const buckets = {};
   for (const a of artifacts) {
@@ -592,17 +630,26 @@ function writeReport(model) {
   };
   const connRow = (r) => `<div class="conn" onclick="openModal('${r.id}')"><div class="conn-t">${esc(idTitle[r.id] || r.id)}</div>${r.snippet ? `<div class="conn-s">${esc(r.snippet)}</div>` : ""}</div>`;
   const connections = (a) => {
-    const out = a.refs && a.refs.length ? `<div class="m-conn"><h3>References (${a.refs.length})</h3>${a.refs.map(connRow).join("")}</div>` : "";
-    const inc = a.refBy && a.refBy.length ? `<div class="m-conn"><h3>Referenced by (${a.refBy.length})</h3>${a.refBy.map(connRow).join("")}</div>` : "";
-    return out + inc;
+    if ((a.refs && a.refs.length) || (a.refBy && a.refBy.length)) {
+      const out = a.refs && a.refs.length ? `<div class="m-conn"><h3>References (${a.refs.length})</h3>${a.refs.map(connRow).join("")}</div>` : "";
+      const inc = a.refBy && a.refBy.length ? `<div class="m-conn"><h3>Referenced by (${a.refBy.length})</h3>${a.refBy.map(connRow).join("")}</div>` : "";
+      return out + inc;
+    }
+    if (a.related && a.related.length) {
+      return `<div class="m-conn"><h3>Related by topic (${a.related.length})</h3>${a.related.map((id) => connRow({ id })).join("")}</div>`;
+    }
+    return "";
   };
   const modalSrc = (a) => {
     return `<div class="msrc" id="src-${esc(a.id)}"><div class="m-head">${badge(a.kind)}<h2>${esc(a.title)}</h2></div><div class="m-meta">${esc(a.subject)} · ${esc(path.basename(a.source.path))}${a.stale ? ` · stale ${a.ageDays}d` : ""}</div><div class="m-sum">${esc(a.summary)}</div>${connections(a)}<div class="m-src-title">Source</div><div class="md">${mdLite(a.body || "")}${a.bodyTruncated ? '<p class="trunc">… truncated</p>' : ""}</div></div>`;
   };
   const modalSrcs = model.artifacts.map(modalSrc).join("");
   const graph = computeGraphLayout(model.artifacts);
+  const relBlurb = model.relationshipMode === "topics"
+    ? `${model.relationshipCount} topical connections. Your notes don't cross-reference each other, so this maps them by the subjects they share`
+    : `${model.relationshipCount} links your own notes drew between each other`;
   const graphHtml = graph.nodes.length
-    ? `<div class="section-title">How your intent connects</div><div class="graph"><div class="gzoom"><button onclick="gZoom(0.7)" title="Zoom in">+</button><button onclick="gZoom(1.45)" title="Zoom out">−</button><button onclick="gReset()" title="Reset view">⤢</button></div>${renderGraphSvg(graph)}</div><div class="ghint">${model.relationshipCount} links between your notes. Zoom with the buttons or scroll, drag to pan, hover a dot for its name, click to open it. Labels appear as you zoom in.</div>`
+    ? `<div class="section-title">How your intent connects</div><div class="graph"><div class="gzoom"><button onclick="gZoom(0.7)" title="Zoom in">+</button><button onclick="gZoom(1.45)" title="Zoom out">−</button><button onclick="gReset()" title="Reset view">⤢</button></div>${renderGraphSvg(graph)}</div><div class="ghint">${relBlurb}. Zoom with the buttons or scroll, drag to pan, hover a dot for its name, click to open it. Labels appear as you zoom in.</div>`
     : "";
 
   const subjectSections = orderedSubjects
@@ -854,7 +901,9 @@ async function main() {
   }
 
   assignSubjects(artifacts); // deterministic clustering; the --llm pass refines it
-  const relationshipCount = resolveRelationships(artifacts);
+  let relationshipMode = "links";
+  let relationshipCount = resolveRelationships(artifacts);
+  if (relationshipCount === 0) { relationshipCount = assignTopicalRelationships(artifacts); relationshipMode = "topics"; }
 
   let conflicts = [];
   if (USE_LLM) {
@@ -882,6 +931,7 @@ async function main() {
     insights,
     conflicts,
     relationshipCount,
+    relationshipMode,
     timeline: computeTimeline(artifacts),
     repoGuidance,
     artifacts,
