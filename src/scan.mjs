@@ -171,7 +171,7 @@ async function llmClassify(artifacts) {
     ({ default: Anthropic } = await import("@anthropic-ai/sdk"));
   } catch {
     console.warn("  --llm requested but @anthropic-ai/sdk not installed; run `npm install`. Falling back to heuristics.");
-    return artifacts;
+    return { artifacts, conflicts: [] };
   }
   const client = new Anthropic();
 
@@ -260,7 +260,44 @@ ${listing}`;
   } catch (e) {
     console.warn("  LLM classify failed (" + (e?.message || e) + "). Keeping heuristics.");
   }
-  return artifacts;
+
+  // Scan the pinned decisions for contradictions / overlaps / supersessions.
+  let conflicts = [];
+  const canon = artifacts.filter((a) => a.kind === "canon");
+  if (canon.length > 1) {
+    try {
+      const cSchema = {
+        type: "object", additionalProperties: false, required: ["conflicts"],
+        properties: {
+          conflicts: {
+            type: "array",
+            items: {
+              type: "object", additionalProperties: false,
+              required: ["a", "b", "type", "note"],
+              properties: {
+                a: { type: "string" },
+                b: { type: "string" },
+                type: { type: "string", enum: ["contradiction", "overlap", "supersession"] },
+                note: { type: "string" },
+              },
+            },
+          },
+        },
+      };
+      const cList = canon.map((a) => `- ${a.title}: ${a.summary}`).join("\n");
+      const cResp = await client.messages.create({
+        model: "claude-opus-4-8",
+        max_tokens: 4000,
+        output_config: { format: { type: "json_schema", schema: cSchema } },
+        messages: [{ role: "user", content: `These are pinned decisions ("canon") from ONE project. Find pairs that genuinely contradict each other, substantially overlap, or where one clearly supersedes another. Use the exact titles for a and b. Be conservative: only report real ones, and return an empty list if there are none.\n\n${cList}` }],
+      });
+      conflicts = JSON.parse(cResp.content.find((b) => b.type === "text")?.text || "{}").conflicts || [];
+      console.log(`  conflict scan: ${conflicts.length} found among ${canon.length} decisions.`);
+    } catch (e) {
+      console.warn("  conflict scan failed (" + (e?.message || e) + ").");
+    }
+  }
+  return { artifacts, conflicts };
 }
 
 // ---------- output writers ----------
@@ -338,41 +375,122 @@ function writeProjection(model) {
   fs.writeFileSync(path.join(outDir, "projected", "CLAUDE.md"), md);
 }
 
+function computeInsights(artifacts, byKind) {
+  const durable = (byKind.perspective || 0) + (byKind.canon || 0);
+  const transient = (byKind.plan || 0) + (byKind.noise || 0);
+  const stale = artifacts.filter((a) => a.stale).sort((a, b) => b.ageDays - a.ageDays);
+  const subjects = new Set(artifacts.map((a) => a.subject));
+  const perspBySubject = {};
+  for (const a of artifacts) if (a.kind === "perspective") (perspBySubject[a.subject] ||= []).push(a);
+  const consolidations = Object.entries(perspBySubject)
+    .filter(([, items]) => items.length >= 3)
+    .map(([subject, items]) => ({ subject, count: items.length }))
+    .sort((a, b) => b.count - a.count);
+  return {
+    surfaced: artifacts.length,
+    durable,
+    transient,
+    subjectsOut: subjects.size,
+    staleCount: stale.length,
+    staleList: stale.map((a) => ({ title: a.title, ageDays: a.ageDays })),
+    consolidations,
+  };
+}
+
 function writeReport(model) {
   const kinds = model.counts.byKind;
+  const ins = model.insights;
+  const conflicts = model.conflicts || [];
+  const ranLLM = /llm/.test(model.mode);
   const bySubject = {};
   for (const a of model.artifacts) (bySubject[a.subject] ||= []).push(a);
   const orderedSubjects = Object.entries(bySubject).sort((a, b) => b[1].length - a[1].length);
-  const staleCount = model.artifacts.filter((a) => a.stale).length;
   const gaps = orderedSubjects
     .filter(([, items]) => items.some((i) => i.kind === "plan") && !items.some((i) => i.kind === "perspective"))
     .map(([s]) => s);
+  const flagged = ins.staleCount + conflicts.length + ins.consolidations.length + gaps.length;
+
+  const KIND = {
+    perspective: ["Perspective", "Durable knowledge or a viewpoint worth keeping.", "What you want every AI tool to consistently understand about this project."],
+    canon: ["Canon", "A decision or rule you have pinned.", "Your calls. They should be honored everywhere, not rediscovered or contradicted."],
+    plan: ["Plan", "A transient working note, status, or investigation.", "Operational and expected to age out, so it is set aside from your durable intent."],
+    reference: ["Reference", "A lookup table or inventory.", "Handy facts, kept for reference."],
+  };
 
   const badge = (kind) => `<span class="badge ${kind}">${kind}</span>`;
   const card = (a) =>
-    `<div class="card"><div class="card-h">${badge(a.kind)}<span class="title">${esc(a.title)}</span>${a.stale ? `<span class="stale">stale ${a.ageDays}d</span>` : ""}</div><div class="summary">${esc(a.summary)}</div><div class="src">${esc(a.source.tool)} · ${esc(path.basename(a.source.path))}</div></div>`;
+    `<div class="card"><div class="card-h">${badge(a.kind)}<span class="title">${esc(a.title)}</span>${a.stale ? `<span class="stale">stale ${a.ageDays}d</span>` : ""}</div><div class="summary">${esc(a.summary)}</div><div class="src">${esc(path.basename(a.source.path))}</div></div>`;
 
   const subjectSections = orderedSubjects
-    .map(
-      ([subject, items]) =>
-        `<section class="subject"><h2>${esc(subject)} <span class="count">${items.length}</span></h2><div class="grid">${items.sort((x, y) => x.ageDays - y.ageDays).map(card).join("")}</div></section>`,
-    )
+    .map(([subject, items]) => `<section class="subject"><h2>${esc(subject)} <span class="count">${items.length}</span></h2><div class="grid">${items.slice().sort((x, y) => x.ageDays - y.ageDays).map(card).join("")}</div></section>`)
     .join("");
+
+  const legend = Object.entries(KIND)
+    .filter(([k]) => (kinds[k] || 0) > 0)
+    .map(([k, [name, what, why]]) => `<div class="leg"><div class="leg-h">${badge(k)}<b>${name}</b><span class="leg-n">${kinds[k] || 0}</span></div><div class="leg-what">${what}</div><div class="leg-why">${why}</div></div>`)
+    .join("");
+
+  const didCard = (n, label, sub) => `<div class="did-card"><b>${n}</b><div class="did-l">${label}</div><div class="did-s">${sub}</div></div>`;
+  const did = [
+    didCard(ins.surfaced, "surfaced", "pieces of intent that were invisible, living in Claude's local memory, not your repo"),
+    didCard(`${ins.durable} <span class="slash">kept</span> / ${ins.transient}`, "sorted", "durable knowledge and decisions separated from transient working notes"),
+    didCard(`${model.counts.total} <span class="slash">into</span> ${ins.subjectsOut}`, "organized", "scattered files grouped into clear subject areas"),
+    didCard(flagged, "flagged", "things worth a look: stale intent, conflicts, and cleanup opportunities (below)"),
+  ].join("");
+
+  const attn = [];
+  if (ranLLM) {
+    if (conflicts.length) {
+      attn.push(`<div class="ab warn"><h4>${conflicts.length} possible conflict${conflicts.length > 1 ? "s" : ""} between your decisions</h4><p class="why">Two pinned decisions appear to clash. Left unresolved, your AI gets different guidance depending on which one it happens to read.</p>${conflicts.map((c) => `<div class="pair"><span class="ptag">${esc(c.type)}</span> <b>${esc(c.a)}</b> vs <b>${esc(c.b)}</b><div class="pnote">${esc(c.note)}</div></div>`).join("")}</div>`);
+    } else {
+      attn.push(`<div class="ab ok"><h4>No conflicts found</h4><p class="why">Your ${kinds.canon || 0} pinned decisions were checked against one another and none appear to contradict.</p></div>`);
+    }
+  } else {
+    attn.push(`<div class="ab muted"><h4>Conflict scan not run</h4><p class="why">Re-run with <code>--llm</code> to check whether any of your pinned decisions contradict each other.</p></div>`);
+  }
+  if (ins.staleCount) {
+    const top = ins.staleList.slice(0, 6);
+    attn.push(`<div class="ab warn"><h4>${ins.staleCount} may be out of date</h4><p class="why">Not touched in ${STALE_DAYS}+ days. Intent drifts: a rule or fact set months ago may no longer match how the project actually works. Worth a review, or retire it.</p><ul class="mini">${top.map((s) => `<li>${esc(s.title)} <span class="age">${s.ageDays}d</span></li>`).join("")}${ins.staleCount > top.length ? `<li class="more">+ ${ins.staleCount - top.length} more</li>` : ""}</ul></div>`);
+  }
+  if (ins.consolidations.length) {
+    attn.push(`<div class="ab info"><h4>${ins.consolidations.length} area${ins.consolidations.length > 1 ? "s" : ""} to unify</h4><p class="why">These subjects hold several overlapping perspectives that started life as separate files. Good candidates to consolidate into one cleaner source.</p><ul class="mini">${ins.consolidations.map((c) => `<li>${esc(c.subject)} <span class="age">${c.count} files</span></li>`).join("")}</ul></div>`);
+  }
+  if (gaps.length) {
+    attn.push(`<div class="ab info"><h4>${gaps.length} area${gaps.length > 1 ? "s" : ""} with notes but no codified knowledge</h4><p class="why">Plenty of working notes here, but nothing promoted to durable knowledge yet. Candidates to compile into a perspective.</p><ul class="mini">${gaps.map((g) => `<li>${esc(g)}</li>`).join("")}</ul></div>`);
+  }
 
   const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Intent · ${esc(model.project)}</title>
 <style>
 :root{--bg:#faf9f6;--fg:#1a1a1a;--mut:#6b6b6b;--line:#e6e3dc;--accent:#9a6a4a;--card:#fff}
-*{box-sizing:border-box}body{margin:0;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--fg);background:var(--bg)}
-.wrap{max-width:1040px;margin:0 auto;padding:48px 24px 96px}
-header h1{font-size:28px;margin:0 0 4px;font-weight:650}
-header .sub{color:var(--mut);margin-bottom:24px}
-.stats{display:flex;gap:24px;flex-wrap:wrap;padding:16px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line);margin-bottom:8px}
-.stat{display:flex;flex-direction:column}.stat b{font-size:22px;font-weight:650}.stat span{color:var(--mut);font-size:13px}
-.attention{background:#fdf6ee;border:1px solid #eaddc9;border-radius:10px;padding:14px 18px;margin:24px 0}
-.attention h3{margin:0 0 6px;font-size:14px;letter-spacing:.02em;text-transform:uppercase;color:var(--accent)}
-.attention ul{margin:0;padding-left:18px;color:#5a4a3a}.attention li{margin:2px 0}
-.subject{margin:36px 0}.subject h2{font-size:19px;font-weight:640;margin:0 0 14px;display:flex;align-items:center;gap:10px}
+*{box-sizing:border-box}body{margin:0;font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--fg);background:var(--bg)}
+.wrap{max-width:1060px;margin:0 auto;padding:52px 24px 96px}
+h1{font-size:30px;margin:0 0 6px;font-weight:660;letter-spacing:-0.01em}
+.sub{color:var(--mut);margin:0 0 20px}
+.intro{font-size:16px;color:#333;max-width:70ch;margin:0 0 8px}
+.intro b{color:#111}
+.section-title{font-size:13px;font-weight:680;text-transform:uppercase;letter-spacing:.06em;color:var(--accent);margin:40px 0 14px}
+.did{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}
+.did-card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+.did-card>b{font-size:26px;font-weight:680;display:block}.did-card .slash{font-size:14px;color:var(--mut);font-weight:400}
+.did-l{font-size:12px;font-weight:680;text-transform:uppercase;letter-spacing:.05em;color:var(--accent);margin:2px 0 6px}
+.did-s{font-size:13px;color:#555;line-height:1.45}
+.legend{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
+.leg{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:13px 15px}
+.leg-h{display:flex;align-items:center;gap:8px;margin-bottom:5px}.leg-h b{font-size:15px}.leg-n{margin-left:auto;color:var(--mut);font-size:13px}
+.leg-what{font-size:13.5px;color:#333}.leg-why{font-size:12.5px;color:var(--mut);margin-top:4px}
+.attn{display:grid;gap:12px}
+.ab{border:1px solid var(--line);border-radius:10px;padding:14px 16px;background:var(--card)}
+.ab h4{margin:0 0 4px;font-size:15px}.ab .why{margin:0;font-size:13.5px;color:#555;line-height:1.5}
+.ab.warn{background:#fdf6ee;border-color:#ecd9bf}.ab.warn h4{color:#a5602a}
+.ab.ok{background:#f0f6ef;border-color:#d5e4d2}.ab.ok h4{color:#3d6b3d}
+.ab.info{background:#eef2f7;border-color:#d5dfeb}.ab.info h4{color:#3a5d88}
+.ab.muted{background:#f5f3ee}.ab.muted h4{color:var(--mut)}
+.pair{margin-top:10px;font-size:13.5px}.ptag{font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;background:#e9dcc7;color:#8a5a2a;border-radius:4px;padding:1px 6px}
+.pnote{color:#555;font-size:13px;margin-top:2px}
+.mini{margin:10px 0 0;padding:0;list-style:none;columns:2;column-gap:24px}
+.mini li{font-size:13px;margin:2px 0;break-inside:avoid}.mini .age{color:var(--mut);font-size:11.5px}.mini .more{color:var(--mut)}
+.subject{margin:30px 0}.subject h2{font-size:19px;font-weight:640;margin:0 0 12px;display:flex;align-items:center;gap:10px}
 .subject .count{font-size:13px;color:var(--mut);font-weight:400;background:var(--line);border-radius:20px;padding:1px 9px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
@@ -382,33 +500,29 @@ header .sub{color:var(--mut);margin-bottom:24px}
 .badge.perspective{background:#e8f0e8;color:#3d6b3d}.badge.canon{background:#efe6f5;color:#6b4a8a}
 .badge.plan{background:#eef1f5;color:#4a6488}.badge.reference{background:#f0ece3;color:#7a6a4a}.badge.noise{background:#eee;color:#888}
 .stale{font-size:11px;color:#a5602a;background:#f8ecdd;border-radius:5px;padding:1px 6px}
-footer{margin-top:56px;padding-top:20px;border-top:1px solid var(--line);color:var(--mut);font-size:13px}
-code{font-family:ui-monospace,Menlo,monospace;background:#f0ede6;padding:1px 5px;border-radius:4px}
+.divider{border:0;border-top:1px solid var(--line);margin:40px 0 0}
+footer{margin-top:44px;padding-top:20px;border-top:1px solid var(--line);color:var(--mut);font-size:13px;line-height:1.6}
+code{font-family:ui-monospace,Menlo,monospace;background:#f0ede6;padding:1px 5px;border-radius:4px;font-size:.9em}
 </style></head><body><div class="wrap">
-<header>
 <h1>${esc(model.project)}</h1>
-<div class="sub">Everything this project's AI knows and decides, made visible. Pass: <b>${model.mode}</b>.</div>
-</header>
-<div class="stats">
-<div class="stat"><b>${model.counts.total}</b><span>artifacts surfaced</span></div>
-<div class="stat"><b>${kinds.perspective || 0}</b><span>perspectives</span></div>
-<div class="stat"><b>${kinds.canon || 0}</b><span>canon (pinned rules)</span></div>
-<div class="stat"><b>${kinds.plan || 0}</b><span>plans / working notes</span></div>
-<div class="stat"><b>${orderedSubjects.length}</b><span>subject areas</span></div>
-<div class="stat"><b>${staleCount}</b><span>stale (&gt;${STALE_DAYS}d)</span></div>
-</div>
-<div class="attention">
-<h3>Attention</h3>
-<ul>
-<li><b>${model.counts.total}</b> intent artifacts were invisible: they live in Claude's hidden cache at <code>~/.claude/projects/…/memory</code>, not in your repo.</li>
-${staleCount ? `<li><b>${staleCount}</b> are stale (not touched in ${STALE_DAYS}+ days) and may no longer reflect the project.</li>` : ""}
-${gaps.length ? `<li>Subject areas with active plans but no codified perspective (candidates to compile): ${gaps.map((g) => "<b>" + esc(g) + "</b>").join(", ")}.</li>` : ""}
-<li>Compiled into a portable <code>.intent/</code> folder + a generated <code>projected/CLAUDE.md</code> so any tool can read the same intent.</li>
-</ul>
-</div>
+<div class="sub">Your project's AI intent, made visible.</div>
+<p class="intro">As you built <b>${esc(model.project)}</b> with AI, it quietly accumulated <b>${ins.surfaced}</b> pieces of "intent": decisions you made, rules you set, and knowledge you taught it. Almost none of it was visible. It lived in Claude Code's local memory, not your repo. Here is what was there, what it means, and what got done with it.</p>
+
+<div class="section-title">What intent-scan did</div>
+<div class="did">${did}</div>
+
+<div class="section-title">What these are, and why they matter</div>
+<div class="legend">${legend}</div>
+
+<div class="section-title">Worth your attention</div>
+<div class="attn">${attn.join("")}</div>
+
+<hr class="divider">
+<div class="section-title">The intent, by area</div>
 ${subjectSections}
+
 <footer>
-Generated by intent-scan (prototype) from ${esc(model.sources.map((s) => s.tool + ":" + s.kind).join(", "))}. Deterministic pass; run with <code>--llm</code> for semantic synthesis. This report visualizes <code>output/${projectSlug}/.intent/</code>.
+Every item above is cited to the source file it came from, so nothing is invented. Pass: <b>${esc(model.mode)}</b>${ranLLM ? "" : " (run with <code>--llm</code> for sharper summaries and a conflict scan)"}. Compiled into a portable <code>.intent/</code> folder plus a generated <code>projected/CLAUDE.md</code>, so any tool can read the same intent. Everything stayed on your machine.
 </footer>
 </div></body></html>`;
   fs.writeFileSync(path.join(outDir, "report.html"), html);
@@ -480,13 +594,18 @@ async function main() {
     return;
   }
 
+  let conflicts = [];
   if (USE_LLM) {
     console.log("  running LLM semantic pass...");
-    artifacts = await llmClassify(artifacts);
+    const r = await llmClassify(artifacts);
+    artifacts = r.artifacts;
+    conflicts = r.conflicts;
   }
 
   const byKind = {};
   for (const a of artifacts) byKind[a.kind] = (byKind[a.kind] || 0) + 1;
+
+  const insights = computeInsights(artifacts, byKind);
 
   const model = {
     project: projectName,
@@ -498,6 +617,8 @@ async function main() {
       ...(repoGuidance.length ? [{ tool: "repo", kind: "agent-guidance", paths: repoGuidance.map((r) => r.rel) }] : []),
     ],
     counts: { total: artifacts.length, byKind },
+    insights,
+    conflicts,
     repoGuidance,
     artifacts,
   };
