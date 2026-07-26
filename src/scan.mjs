@@ -165,7 +165,11 @@ function readMemory() {
         source: { tool: "claude", kind: "memory", path: full },
         ageDays,
         stale: ageDays > STALE_DAYS,
+        mtime: stat.mtimeMs,
         preview: body.slice(0, 600),
+        body: body.slice(0, 12000),
+        bodyTruncated: body.length > 12000,
+        links: [...body.matchAll(/\[\[([^\]]+)\]\]/g)].map((m) => m[1].trim()),
       };
     });
 }
@@ -394,6 +398,145 @@ function writeProjection(model) {
   fs.writeFileSync(path.join(outDir, "projected", "CLAUDE.md"), md);
 }
 
+function snippetAround(body, linkText) {
+  const needle = "[[" + linkText + "]]";
+  const i = (body || "").indexOf(needle);
+  if (i < 0) return "";
+  const start = Math.max(0, i - 100), end = Math.min(body.length, i + needle.length + 100);
+  const s = body.slice(start, end).replace(/\[\[([^\]]+)\]\]/g, "$1").replace(/\s+/g, " ").trim();
+  return (start > 0 ? "… " : "") + s + (end < body.length ? " …" : "");
+}
+
+function resolveRelationships(artifacts) {
+  // Turn authored [[wiki-links]] into real edges, keeping the sentence each link sits in.
+  const byBase = new Map();
+  for (const a of artifacts) byBase.set(a.name.replace(/\.md$/, "").toLowerCase(), a);
+  for (const a of artifacts) { a.related = []; a.refs = []; a.refBy = []; }
+  let edges = 0;
+  for (const a of artifacts) {
+    const seen = new Set();
+    for (const link of a.links || []) {
+      const t = byBase.get(link.replace(/\.md$/, "").toLowerCase());
+      if (!t || t === a || seen.has(t.id)) continue;
+      seen.add(t.id);
+      const snippet = snippetAround(a.body, link);
+      a.related.push(t.id);
+      a.refs.push({ id: t.id, snippet });
+      t.refBy.push({ id: a.id, snippet });
+      edges++;
+    }
+  }
+  return edges;
+}
+
+function computeTimeline(artifacts) {
+  const buckets = {};
+  for (const a of artifacts) {
+    const d = new Date(a.mtime);
+    const key = d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0");
+    buckets[key] = (buckets[key] || 0) + 1;
+  }
+  const keys = Object.keys(buckets).sort();
+  if (!keys.length) return [];
+  const out = [];
+  let [y, m] = keys[0].split("-").map(Number);
+  const [ly, lm] = keys[keys.length - 1].split("-").map(Number);
+  while (y < ly || (y === ly && m <= lm)) {
+    const key = y + "-" + String(m).padStart(2, "0");
+    out.push({ month: key, count: buckets[key] || 0 });
+    m++;
+    if (m > 12) { m = 1; y++; }
+  }
+  return out;
+}
+
+function mdLite(text) {
+  const e = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const inline = (s) => e(s).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\[\[([^\]]+)\]\]/g, '<span class="wl">$1</span>');
+  let html = "", inList = false, inCode = false;
+  for (const raw of String(text).split("\n")) {
+    if (/^```/.test(raw)) { html += inCode ? "</pre>" : "<pre class='code'>"; inCode = !inCode; continue; }
+    if (inCode) { html += e(raw) + "\n"; continue; }
+    if (/^\s*[-*]\s+/.test(raw)) { if (!inList) { html += "<ul>"; inList = true; } html += "<li>" + inline(raw.replace(/^\s*[-*]\s+/, "")) + "</li>"; continue; }
+    if (inList) { html += "</ul>"; inList = false; }
+    const h = raw.match(/^(#{1,4})\s+(.*)/);
+    if (h) { const n = Math.min(6, h[1].length + 2); html += `<h${n}>${inline(h[2])}</h${n}>`; continue; }
+    if (raw.trim()) html += "<p>" + inline(raw) + "</p>";
+  }
+  if (inList) html += "</ul>";
+  if (inCode) html += "</pre>";
+  return html;
+}
+
+// Force-directed layout computed at generation time, so the graph is a static
+// (but clickable) SVG with no client-side physics.
+function computeGraphLayout(artifacts) {
+  const referenced = new Set();
+  for (const a of artifacts) for (const r of a.related || []) referenced.add(r);
+  const nodes = artifacts.filter((a) => (a.related && a.related.length) || referenced.has(a.id));
+  const idx = new Map(nodes.map((a, i) => [a.id, i]));
+  const eset = new Set();
+  const E = [];
+  for (const a of nodes)
+    for (const r of a.related || []) {
+      if (!idx.has(r)) continue;
+      let i = idx.get(a.id), j = idx.get(r);
+      if (i === j) continue;
+      if (i > j) { const t = i; i = j; j = t; }
+      const k = i + "-" + j;
+      if (!eset.has(k)) { eset.add(k); E.push([i, j]); }
+    }
+  const n = nodes.length;
+  if (!n) return { nodes: [], edges: [] };
+  const pos = nodes.map((_, i) => ({ x: Math.cos((2 * Math.PI * i) / n), y: Math.sin((2 * Math.PI * i) / n) }));
+  const deg = nodes.map(() => 0);
+  for (const [i, j] of E) { deg[i]++; deg[j]++; }
+  for (let it = 0; it < 300; it++) {
+    const disp = pos.map(() => ({ x: 0, y: 0 }));
+    for (let i = 0; i < n; i++)
+      for (let j = i + 1; j < n; j++) {
+        const dx = pos[i].x - pos[j].x, dy = pos[i].y - pos[j].y, d2 = dx * dx + dy * dy + 0.01, f = 0.06 / d2;
+        disp[i].x += dx * f; disp[i].y += dy * f; disp[j].x -= dx * f; disp[j].y -= dy * f;
+      }
+    for (const [i, j] of E) {
+      const dx = pos[j].x - pos[i].x, dy = pos[j].y - pos[i].y, d = Math.sqrt(dx * dx + dy * dy) + 0.01, f = ((d - 0.5) * 0.12) / d;
+      disp[i].x += dx * f; disp[i].y += dy * f; disp[j].x -= dx * f; disp[j].y -= dy * f;
+    }
+    const cool = 1 - it / 300, lim = 0.1;
+    for (let i = 0; i < n; i++) {
+      disp[i].x -= pos[i].x * 0.015; disp[i].y -= pos[i].y * 0.015;
+      pos[i].x += Math.max(-lim, Math.min(lim, disp[i].x)) * cool * 3;
+      pos[i].y += Math.max(-lim, Math.min(lim, disp[i].y)) * cool * 3;
+    }
+  }
+  return { nodes: nodes.map((a, i) => ({ id: a.id, title: a.title, kind: a.kind, x: pos[i].x, y: pos[i].y, deg: deg[i] })), edges: E };
+}
+
+function renderGraphSvg(graph) {
+  if (!graph.nodes.length) return "";
+  const KCOL = { perspective: "#3d6b3d", canon: "#6b4a8a", plan: "#4a6488", reference: "#7a6a4a", noise: "#999" };
+  const xs = graph.nodes.map((n) => n.x), ys = graph.nodes.map((n) => n.y);
+  const minx = Math.min(...xs), maxx = Math.max(...xs), miny = Math.min(...ys), maxy = Math.max(...ys);
+  const W = 920, H = 560, pad = 46;
+  const sx = (x) => pad + (maxx > minx ? (x - minx) / (maxx - minx) : 0.5) * (W - 2 * pad);
+  const sy = (y) => pad + (maxy > miny ? (y - miny) / (maxy - miny) : 0.5) * (H - 2 * pad);
+  const P = graph.nodes.map((n) => ({ x: sx(n.x), y: sy(n.y) }));
+  const edges = graph.edges.map(([i, j]) => `<line x1="${P[i].x.toFixed(1)}" y1="${P[i].y.toFixed(1)}" x2="${P[j].x.toFixed(1)}" y2="${P[j].y.toFixed(1)}" stroke="#c9c3b8" stroke-width="0.8" opacity="0.6"/>`).join("");
+  const rOf = (n) => 3 + Math.min(9, n.deg * 0.9);
+  // circles first, then all labels, so labels always sit on top of every dot.
+  const circles = graph.nodes.map((n, i) => `<circle class="gnode" cx="${P[i].x.toFixed(1)}" cy="${P[i].y.toFixed(1)}" r="${rOf(n).toFixed(1)}" fill="${KCOL[n.kind] || "#999"}" onclick="openModal('${n.id}')"><title>${esc(n.title)}</title></circle>`).join("");
+  // font-size/stroke-width are unitless (user units), so labels scale with the
+  // viewBox zoom. data-r is the viewBox width at/below which this label reveals:
+  // larger for more-connected nodes, so hubs appear first, leaves last.
+  const order = graph.nodes.map((_, i) => i).sort((a, b) => graph.nodes[b].deg - graph.nodes[a].deg);
+  const rank = new Array(graph.nodes.length);
+  order.forEach((idx, r) => (rank[idx] = r));
+  const N = graph.nodes.length;
+  const revealW = (i) => Math.max(140, Math.round(1000 - rank[i] * (860 / Math.max(1, N - 1))));
+  const labels = graph.nodes.map((n, i) => `<text class="lbl" data-r="${revealW(i)}" x="${P[i].x.toFixed(1)}" y="${(P[i].y - rOf(n) - 4).toFixed(1)}" font-size="9" stroke-width="2.4">${esc(n.title).slice(0, 26)}</text>`).join("");
+  return `<svg id="gsvg" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">${edges}${circles}${labels}</svg>`;
+}
+
 function computeInsights(artifacts, byKind) {
   const durable = (byKind.perspective || 0) + (byKind.canon || 0);
   const transient = (byKind.plan || 0) + (byKind.noise || 0);
@@ -436,9 +579,31 @@ function writeReport(model) {
     reference: ["Reference", "A lookup table or inventory.", "Handy facts, kept for reference."],
   };
 
+  const idTitle = Object.fromEntries(model.artifacts.map((a) => [a.id, a.title]));
   const badge = (kind) => `<span class="badge ${kind}">${kind}</span>`;
-  const card = (a) =>
-    `<div class="card"><div class="card-h">${badge(a.kind)}<span class="title">${esc(a.title)}</span>${a.stale ? `<span class="stale">stale ${a.ageDays}d</span>` : ""}</div><div class="summary">${esc(a.summary)}</div><div class="src">${esc(path.basename(a.source.path))}</div></div>`;
+  const relChips = (a, inModal) =>
+    (a.related || [])
+      .map((id) => `<span class="rel" onclick="${inModal ? "" : "event.stopPropagation();"}openModal('${id}')">${esc(idTitle[id] || id)}</span>`)
+      .join("");
+  const card = (a) => {
+    const rels = relChips(a, false);
+    const dq = esc((a.title + " " + a.summary + " " + a.subject + " " + a.kind).toLowerCase());
+    return `<div class="card" id="a-${esc(a.id)}" data-q="${dq}" onclick="openModal('${esc(a.id)}')"><div class="card-h">${badge(a.kind)}<span class="title">${esc(a.title)}</span>${a.stale ? `<span class="stale">stale ${a.ageDays}d</span>` : ""}</div><div class="summary">${esc(a.summary)}</div>${rels ? `<div class="rels"><span class="rl">Related:</span> ${rels}</div>` : ""}</div>`;
+  };
+  const connRow = (r) => `<div class="conn" onclick="openModal('${r.id}')"><div class="conn-t">${esc(idTitle[r.id] || r.id)}</div>${r.snippet ? `<div class="conn-s">${esc(r.snippet)}</div>` : ""}</div>`;
+  const connections = (a) => {
+    const out = a.refs && a.refs.length ? `<div class="m-conn"><h3>References (${a.refs.length})</h3>${a.refs.map(connRow).join("")}</div>` : "";
+    const inc = a.refBy && a.refBy.length ? `<div class="m-conn"><h3>Referenced by (${a.refBy.length})</h3>${a.refBy.map(connRow).join("")}</div>` : "";
+    return out + inc;
+  };
+  const modalSrc = (a) => {
+    return `<div class="msrc" id="src-${esc(a.id)}"><div class="m-head">${badge(a.kind)}<h2>${esc(a.title)}</h2></div><div class="m-meta">${esc(a.subject)} · ${esc(path.basename(a.source.path))}${a.stale ? ` · stale ${a.ageDays}d` : ""}</div><div class="m-sum">${esc(a.summary)}</div>${connections(a)}<div class="m-src-title">Source</div><div class="md">${mdLite(a.body || "")}${a.bodyTruncated ? '<p class="trunc">… truncated</p>' : ""}</div></div>`;
+  };
+  const modalSrcs = model.artifacts.map(modalSrc).join("");
+  const graph = computeGraphLayout(model.artifacts);
+  const graphHtml = graph.nodes.length
+    ? `<div class="section-title">How your intent connects</div><div class="graph"><div class="gzoom"><button onclick="gZoom(0.7)" title="Zoom in">+</button><button onclick="gZoom(1.45)" title="Zoom out">−</button><button onclick="gReset()" title="Reset view">⤢</button></div>${renderGraphSvg(graph)}</div><div class="ghint">${model.relationshipCount} links between your notes. Zoom with the buttons or scroll, drag to pan, hover a dot for its name, click to open it. Labels appear as you zoom in.</div>`
+    : "";
 
   const subjectSections = orderedSubjects
     .map(([subject, items]) => `<section class="subject"><h2>${esc(subject)} <span class="count">${items.length}</span></h2><div class="grid">${items.slice().sort((x, y) => x.ageDays - y.ageDays).map(card).join("")}</div></section>`)
@@ -456,8 +621,16 @@ function writeReport(model) {
     didCard(ins.surfaced, "surfaced", "pieces of intent that were invisible, living in Claude's local memory, not in your repo."),
     didCard(ins.durable, "worth keeping", `durable knowledge and decisions. ${plural(ins.transient, "transient note")} set aside${refCount ? `, ${plural(refCount, "reference")} kept` : ""}.`),
     didCard(ins.subjectsOut, ins.subjectsOut === 1 ? "area" : "areas", `${plural(model.counts.total, "scattered file")} organized into subject areas.`),
+    ...(model.relationshipCount ? [didCard(model.relationshipCount, "connected", "links your own notes drew to each other, now navigable.")] : []),
     didCard(flagged, "flagged", "worth a look: stale intent, conflicts, and cleanup opportunities (below)."),
   ].join("");
+
+  const tl = model.timeline || [];
+  const tlMax = Math.max(1, ...tl.map((t) => t.count));
+  const timelineHtml = tl.length > 1
+    ? `<div class="section-title">When this intent was built</div><div class="timeline">${tl.map((t) => `<div class="tl-col" title="${t.month}: ${t.count}"><div class="tl-bar" style="height:${Math.round(4 + (t.count / tlMax) * 54)}px"></div><div class="tl-lbl">${t.month.slice(2)}</div></div>`).join("")}</div><div class="tl-note">${tl.length} months of accumulated intent. Bar height is how much was created or last touched that month.</div>`
+    : "";
+  const searchHtml = `<input id="q" class="search" placeholder="Filter ${model.counts.total} items by keyword…" oninput="filterCards(this.value)">`;
 
   const attn = [];
   if (ranLLM) {
@@ -524,6 +697,51 @@ h1{font-size:30px;margin:0 0 6px;font-weight:660;letter-spacing:-0.01em}
 .divider{border:0;border-top:1px solid var(--line);margin:40px 0 0}
 footer{margin-top:44px;padding-top:20px;border-top:1px solid var(--line);color:var(--mut);font-size:13px;line-height:1.6}
 code{font-family:ui-monospace,Menlo,monospace;background:#f0ede6;padding:1px 5px;border-radius:4px;font-size:.9em}
+.timeline{display:flex;gap:3px;align-items:flex-end;overflow-x:auto;padding:8px 0 2px}
+.tl-col{display:flex;flex-direction:column;align-items:center;min-width:20px}
+.tl-bar{width:13px;background:var(--accent);border-radius:3px 3px 0 0;opacity:.85}
+.tl-lbl{font-size:9px;color:var(--mut);margin-top:4px;white-space:nowrap}
+.tl-note{font-size:12.5px;color:var(--mut);margin-top:6px}
+.search{width:100%;padding:10px 14px;border:1px solid var(--line);border-radius:9px;font-size:14px;background:#fff;margin:0 0 16px}
+.rels{font-size:12px;color:var(--mut);margin-top:8px}
+.rels .rel{color:var(--accent);text-decoration:none;margin-right:10px;white-space:nowrap}.rels .rel:hover{text-decoration:underline}
+.drill{margin-top:10px;border-top:1px solid var(--line);padding-top:8px}
+.drill summary{cursor:pointer;font-size:12px;color:var(--mut);font-family:ui-monospace,Menlo,monospace}
+.md{font-size:13px;color:#333;margin-top:10px;max-height:420px;overflow:auto;padding-right:6px}
+.md h3,.md h4,.md h5,.md h6{margin:10px 0 4px;font-size:14px}.md p{margin:6px 0}.md ul{margin:6px 0;padding-left:20px}.md li{margin:2px 0}
+.md pre.code{background:#f2efe9;padding:8px 10px;border-radius:6px;overflow-x:auto;font-size:12px}
+.md code{background:#f0ede6;padding:1px 4px;border-radius:3px}.md .wl{color:var(--accent);font-weight:600}
+.trunc{color:var(--mut);font-style:italic}
+.rels{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:baseline;font-size:12px;margin-top:8px}
+.rels .rl{color:var(--mut)}
+.rel{cursor:pointer;color:var(--accent);white-space:nowrap}.rel:hover{text-decoration:underline}
+.card{cursor:pointer;transition:border-color .1s}.card:hover{border-color:var(--accent)}
+.graph{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:8px;overflow:auto}
+.graph svg{display:block;width:100%;height:auto}
+.gnode{cursor:pointer}.gnode:hover{stroke:#1a1a1a;stroke-width:1.2}
+.modal{position:fixed;inset:0;background:rgba(20,18,15,.5);display:none;z-index:100;overflow:auto}
+.modal.open{display:block}
+.modal-box{max-width:820px;margin:32px auto;background:var(--card);border-radius:14px;padding:26px 32px;position:relative;box-shadow:0 24px 70px rgba(0,0,0,.3)}
+.modal-x{position:absolute;top:12px;right:16px;border:0;background:none;font-size:28px;line-height:1;cursor:pointer;color:var(--mut)}
+.m-head{display:flex;align-items:center;gap:10px;padding-right:30px}.m-head h2{margin:0;font-size:22px}
+.m-meta{color:var(--mut);font-size:12.5px;font-family:ui-monospace,Menlo,monospace;margin:8px 0}
+.m-sum{font-size:15px;color:#333;margin:6px 0 14px}
+.modal .md{max-height:none}
+.graph{height:600px;overflow:hidden;position:relative;padding:0}
+.graph svg{width:100%;height:100%;cursor:grab;touch-action:none}
+.graph svg:active{cursor:grabbing}
+.ghint{font-size:12.5px;color:var(--mut);margin-top:8px}
+.gzoom{position:absolute;top:10px;right:10px;display:flex;flex-direction:column;gap:5px;z-index:2}
+.gzoom button{width:30px;height:30px;border:1px solid var(--line);background:#fff;border-radius:7px;font-size:17px;cursor:pointer;color:#333;line-height:1;display:flex;align-items:center;justify-content:center}
+.gzoom button:hover{border-color:var(--accent)}
+.lbl{fill:#2a2a2a;stroke:#faf9f6;paint-order:stroke;text-anchor:middle;pointer-events:none}
+.m-conn{margin:14px 0}
+.m-conn h3{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--accent);margin:0 0 6px}
+.conn{border:1px solid var(--line);border-radius:8px;padding:9px 12px;margin-bottom:6px;cursor:pointer;background:#faf9f6}
+.conn:hover{border-color:var(--accent)}
+.conn-t{font-weight:600;font-size:13.5px}
+.conn-s{font-size:12.5px;color:#666;margin-top:3px;line-height:1.45}
+.m-src-title{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);margin:18px 0 0;border-top:1px solid var(--line);padding-top:12px}
 </style></head><body><div class="wrap">
 <h1>${esc(model.project)}</h1>
 <div class="sub">Your project's AI intent, made visible.</div>
@@ -531,6 +749,10 @@ code{font-family:ui-monospace,Menlo,monospace;background:#f0ede6;padding:1px 5px
 
 <div class="section-title">What intent-scan did</div>
 <div class="did">${did}</div>
+
+${timelineHtml}
+
+${graphHtml}
 
 <div class="section-title">What these are, and why they matter</div>
 <div class="legend">${legend}</div>
@@ -540,11 +762,27 @@ code{font-family:ui-monospace,Menlo,monospace;background:#f0ede6;padding:1px 5px
 
 <hr class="divider">
 <div class="section-title">The intent, by area</div>
+${searchHtml}
 ${subjectSections}
 
 <footer>
 Every item above is cited to the source file it came from, so nothing is invented. Pass: <b>${esc(model.mode)}</b>${ranLLM ? "" : " (run with <code>--llm</code> for sharper summaries and a conflict scan)"}. Compiled into a portable <code>.intent/</code> folder plus a generated <code>projected/CLAUDE.md</code>, so any tool can read the same intent. Everything stayed on your machine.
 </footer>
+<div style="display:none">${modalSrcs}</div>
+<div id="modal" class="modal"><div class="modal-box"><button class="modal-x" onclick="closeModal()" aria-label="Close">×</button><div id="modal-body"></div></div></div>
+<script>
+function filterCards(q){q=(q||"").toLowerCase().trim();document.querySelectorAll(".card").forEach(function(c){c.style.display=(!q||(c.dataset.q||"").indexOf(q)>=0)?"":"none";});document.querySelectorAll(".subject").forEach(function(s){var any=Array.prototype.some.call(s.querySelectorAll(".card"),function(c){return c.style.display!=="none";});s.style.display=any?"":"none";});}
+function openModal(id){var s=document.getElementById("src-"+id);if(!s)return;document.getElementById("modal-body").innerHTML=s.innerHTML;var m=document.getElementById("modal");m.classList.add("open");m.scrollTop=0;}
+function closeModal(){document.getElementById("modal").classList.remove("open");}
+document.addEventListener("keydown",function(e){if(e.key==="Escape")closeModal();});
+document.getElementById("modal").addEventListener("click",function(e){if(e.target.id==="modal")closeModal();});
+var GVB={x:0,y:0,w:920,h:560},GLABELS=null,GSW=0;
+function gApply(){var svg=document.getElementById("gsvg");if(!svg)return;svg.setAttribute("viewBox",GVB.x+" "+GVB.y+" "+GVB.w+" "+GVB.h);if(!GLABELS)GLABELS=svg.querySelectorAll(".lbl");if(!GSW)GSW=svg.getBoundingClientRect().width||1000;var fs=(13*GVB.w/GSW),sk=(3.2*GVB.w/GSW);for(var i=0;i<GLABELS.length;i++){var L=GLABELS[i];if(GVB.w<=+L.getAttribute("data-r")){L.style.display="";L.setAttribute("font-size",fs.toFixed(2));L.setAttribute("stroke-width",sk.toFixed(2));}else{L.style.display="none";}}}
+function gZoomAt(cx,cy,k){var nw=Math.max(80,Math.min(2200,GVB.w*k));var nh=nw*(560/920);GVB.x=cx-(cx-GVB.x)*(nw/GVB.w);GVB.y=cy-(cy-GVB.y)*(nh/GVB.h);GVB.w=nw;GVB.h=nh;gApply();}
+function gZoom(k){gZoomAt(GVB.x+GVB.w/2,GVB.y+GVB.h/2,k);}
+function gReset(){GVB={x:0,y:0,w:920,h:560};gApply();}
+(function(){var svg=document.getElementById("gsvg");if(!svg)return;svg.addEventListener("wheel",function(e){e.preventDefault();var r=svg.getBoundingClientRect();var mx=GVB.x+(e.clientX-r.left)/r.width*GVB.w;var my=GVB.y+(e.clientY-r.top)/r.height*GVB.h;var dy=Math.max(-50,Math.min(50,e.deltaY));gZoomAt(mx,my,Math.exp(dy*0.002));},{passive:false});var start=null,last=null,moved=false;svg.addEventListener("mousedown",function(e){start={x:e.clientX,y:e.clientY};last=start;moved=false;});window.addEventListener("mousemove",function(e){if(!last)return;if(Math.abs(e.clientX-start.x)+Math.abs(e.clientY-start.y)>4)moved=true;var r=svg.getBoundingClientRect();GVB.x-=(e.clientX-last.x)/r.width*GVB.w;GVB.y-=(e.clientY-last.y)/r.height*GVB.h;last={x:e.clientX,y:e.clientY};gApply();});window.addEventListener("mouseup",function(){last=null;});svg.addEventListener("click",function(e){if(moved){e.stopPropagation();e.preventDefault();moved=false;}},true);window.addEventListener("resize",function(){GSW=0;gApply();});gApply();})();
+</script>
 </div></body></html>`;
   fs.writeFileSync(path.join(outDir, "report.html"), html);
 }
@@ -616,6 +854,7 @@ async function main() {
   }
 
   assignSubjects(artifacts); // deterministic clustering; the --llm pass refines it
+  const relationshipCount = resolveRelationships(artifacts);
 
   let conflicts = [];
   if (USE_LLM) {
@@ -642,6 +881,8 @@ async function main() {
     counts: { total: artifacts.length, byKind },
     insights,
     conflicts,
+    relationshipCount,
+    timeline: computeTimeline(artifacts),
     repoGuidance,
     artifacts,
   };
