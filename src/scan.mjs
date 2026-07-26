@@ -609,6 +609,7 @@ function writeReport(model) {
     .filter(([, items]) => items.some((i) => i.kind === "plan") && !items.some((i) => i.kind === "perspective"))
     .map(([s]) => s);
   const flagged = ins.staleCount + conflicts.length + ins.consolidations.length + gaps.length;
+  const small = model.counts.total < 15;
 
   const KIND = {
     perspective: ["Perspective", "Durable knowledge or a viewpoint worth keeping.", "What you want every AI tool to consistently understand about this project."],
@@ -648,7 +649,9 @@ function writeReport(model) {
   const relBlurb = model.relationshipMode === "topics"
     ? `${model.relationshipCount} topical connections. Your notes don't cross-reference each other, so this maps them by the subjects they share`
     : `${model.relationshipCount} links your own notes drew between each other`;
-  const graphHtml = graph.nodes.length
+  // Only worth a graph section when there's a real web to show.
+  const showGraph = graph.nodes.length >= 5 && model.relationshipCount >= 4;
+  const graphHtml = showGraph
     ? `<div class="section-title">How your intent connects</div><div class="graph"><div class="gzoom"><button onclick="gZoom(0.7)" title="Zoom in">+</button><button onclick="gZoom(1.45)" title="Zoom out">−</button><button onclick="gReset()" title="Reset view">⤢</button></div>${renderGraphSvg(graph)}</div><div class="ghint">${relBlurb}. Zoom with the buttons or scroll, drag to pan, hover a dot for its name, click to open it. Labels appear as you zoom in.</div>`
     : "";
 
@@ -680,14 +683,8 @@ function writeReport(model) {
   const searchHtml = `<input id="q" class="search" placeholder="Filter ${model.counts.total} items by keyword…" oninput="filterCards(this.value)">`;
 
   const attn = [];
-  if (ranLLM) {
-    if (conflicts.length) {
-      attn.push(`<div class="ab warn"><h4>${conflicts.length} possible conflict${conflicts.length > 1 ? "s" : ""} between your decisions</h4><p class="why">Two pinned decisions appear to clash. Left unresolved, your AI gets different guidance depending on which one it happens to read.</p>${conflicts.map((c) => `<div class="pair"><span class="ptag">${esc(c.type)}</span> <b>${esc(c.a)}</b> vs <b>${esc(c.b)}</b><div class="pnote">${esc(c.note)}</div></div>`).join("")}</div>`);
-    } else {
-      attn.push(`<div class="ab ok"><h4>No conflicts found</h4><p class="why">Your ${kinds.canon || 0} pinned decisions were checked against one another and none appear to contradict.</p></div>`);
-    }
-  } else {
-    attn.push(`<div class="ab muted"><h4>Conflict scan not run</h4><p class="why">Re-run with <code>--llm</code> to check whether any of your pinned decisions contradict each other.</p></div>`);
+  if (conflicts.length) {
+    attn.push(`<div class="ab warn"><h4>${conflicts.length} possible conflict${conflicts.length > 1 ? "s" : ""} between your decisions</h4><p class="why">Two pinned decisions appear to clash. Left unresolved, your AI gets different guidance depending on which one it happens to read.</p>${conflicts.map((c) => `<div class="pair"><span class="ptag">${esc(c.type)}</span> <b>${esc(c.a)}</b> vs <b>${esc(c.b)}</b><div class="pnote">${esc(c.note)}</div></div>`).join("")}</div>`);
   }
   if (ins.staleCount) {
     const top = ins.staleList.slice(0, 6);
@@ -710,6 +707,7 @@ h1{font-size:30px;margin:0 0 6px;font-weight:660;letter-spacing:-0.01em}
 .sub{color:var(--mut);margin:0 0 20px}
 .intro{font-size:16px;color:#333;max-width:70ch;margin:0 0 8px}
 .intro b{color:#111}
+.strip{font-size:14px;color:#666;margin:2px 0 6px}
 .section-title{font-size:13px;font-weight:680;text-transform:uppercase;letter-spacing:.06em;color:var(--accent);margin:40px 0 14px}
 .did{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}
 .did-card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
@@ -792,25 +790,21 @@ code{font-family:ui-monospace,Menlo,monospace;background:#f0ede6;padding:1px 5px
 </style></head><body><div class="wrap">
 <h1>${esc(model.project)}</h1>
 <div class="sub">Your project's AI intent, made visible.</div>
-<p class="intro">As you built <b>${esc(model.project)}</b> with AI, it quietly accumulated <b>${ins.surfaced}</b> pieces of "intent": decisions you made, rules you set, and knowledge you taught it. Almost none of it was visible. It lived in Claude Code's local memory, not your repo. Here is what was there, what it means, and what got done with it.</p>
+<p class="intro">As you built <b>${esc(model.project)}</b> with AI, it quietly accumulated <b>${ins.surfaced}</b> pieces of "intent": decisions you made, rules you set, and knowledge you taught it. Almost none of it was visible. It lived in Claude Code's local memory, not your repo. Below is what was there, each item cited to the exact file it came from. Click any tile to read the full note.</p>
+<div class="strip">${ins.surfaced} surfaced · ${ins.durable} worth keeping · ${plural(ins.subjectsOut, "area")}${model.relationshipCount ? ` · ${model.relationshipCount} connected` : ""}${ins.staleCount ? ` · ${ins.staleCount} stale` : ""}</div>
 
-<div class="section-title">What intent-scan did</div>
-<div class="did">${did}</div>
-
-${timelineHtml}
-
-${graphHtml}
-
-<div class="section-title">What these are, and why they matter</div>
-<div class="legend">${legend}</div>
-
-<div class="section-title">Worth your attention</div>
-<div class="attn">${attn.join("")}</div>
-
-<hr class="divider">
 <div class="section-title">The intent, by area</div>
 ${searchHtml}
 ${subjectSections}
+
+<hr class="divider">
+
+${small ? "" : `<div class="section-title">What intent-scan did</div><div class="did">${did}</div>`}
+${graphHtml}
+${(model.timeline || []).length >= 3 ? timelineHtml : ""}
+<div class="section-title">What these are, and why they matter</div>
+<div class="legend">${legend}</div>
+${attn.length ? `<div class="section-title">Worth your attention</div><div class="attn">${attn.join("")}</div>` : ""}
 
 <footer>
 Every item above is cited to the source file it came from, so nothing is invented. Pass: <b>${esc(model.mode)}</b>${ranLLM ? "" : " (run with <code>--llm</code> for sharper summaries and a conflict scan)"}. Compiled into a portable <code>.intent/</code> folder plus a generated <code>projected/CLAUDE.md</code>, so any tool can read the same intent. Everything stayed on your machine.
