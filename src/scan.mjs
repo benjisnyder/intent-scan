@@ -196,7 +196,7 @@ async function llmClassify(artifacts) {
     ({ default: Anthropic } = await import("@anthropic-ai/sdk"));
   } catch {
     console.warn("  --llm requested but @anthropic-ai/sdk not installed; run `npm install`. Falling back to heuristics.");
-    return { artifacts, conflicts: [] };
+    return { artifacts, conflicts: [], personas: [], semanticRels: [] };
   }
   const client = new Anthropic();
 
@@ -322,7 +322,98 @@ ${listing}`;
       console.warn("  conflict scan failed (" + (e?.message || e) + ").");
     }
   }
-  return { artifacts, conflicts };
+
+  // Propose "experts" (personas) the project's durable knowledge implies.
+  let personas = [];
+  const perspectives = artifacts.filter((a) => a.kind === "perspective");
+  if (perspectives.length >= 3) {
+    try {
+      const pSchema = {
+        type: "object", additionalProperties: false, required: ["experts"],
+        properties: {
+          experts: {
+            type: "array",
+            items: {
+              type: "object", additionalProperties: false,
+              required: ["name", "role", "draws_on", "questions"],
+              properties: {
+                name: { type: "string" },
+                role: { type: "string" },
+                draws_on: { type: "array", items: { type: "string" } },
+                questions: { type: "array", items: { type: "string" } },
+              },
+            },
+          },
+        },
+      };
+      const pList = perspectives.map((a) => `- ${a.title}: ${a.summary}`).join("\n");
+      const pResp = await client.messages.create({
+        model: "claude-opus-4-8",
+        max_tokens: 4000,
+        output_config: { format: { type: "json_schema", schema: pSchema } },
+        messages: [{ role: "user", content: `Below is the durable knowledge captured for ONE software project. Propose 3 to 6 "experts" (personas) this knowledge implies — the specialists whose expertise is embodied here (e.g. "Sports Physiologist", "Payments Engineer"). For each: a short name, a one-line role, the exact perspective titles it draws on (from the list below), and 2 to 3 questions it could answer. Only propose experts genuinely supported by the knowledge.\n\n${pList}` }],
+      });
+      personas = JSON.parse(pResp.content.find((b) => b.type === "text")?.text || "{}").experts || [];
+      console.log(`  personas: proposed ${personas.length}.`);
+    } catch (e) {
+      console.warn("  personas failed (" + (e?.message || e) + ").");
+    }
+  }
+
+  // Infer meaningful semantic relationships (used when notes have no [[links]]).
+  let semanticRels = [];
+  if (artifacts.length >= 4) {
+    try {
+      const rSchema = {
+        type: "object", additionalProperties: false, required: ["links"],
+        properties: {
+          links: {
+            type: "array",
+            items: {
+              type: "object", additionalProperties: false,
+              required: ["a", "b", "reason"],
+              properties: { a: { type: "string" }, b: { type: "string" }, reason: { type: "string" } },
+            },
+          },
+        },
+      };
+      const rList = artifacts.map((a) => `- ${a.title}: ${a.summary}`).join("\n");
+      const rResp = await client.messages.create({
+        model: "claude-opus-4-8",
+        max_tokens: 8000,
+        output_config: { format: { type: "json_schema", schema: rSchema } },
+        messages: [{ role: "user", content: `Below are notes from ONE project. Identify the meaningful relationships between pairs of them (one depends on, informs, or closely relates to another). Use the exact titles for a and b, and a short reason. Favor the strongest connections, not every possible pair.\n\n${rList}` }],
+      });
+      semanticRels = JSON.parse(rResp.content.find((b) => b.type === "text")?.text || "{}").links || [];
+      console.log(`  relationships: inferred ${semanticRels.length}.`);
+    } catch (e) {
+      console.warn("  relationships failed (" + (e?.message || e) + ").");
+    }
+  }
+
+  return { artifacts, conflicts, personas, semanticRels };
+}
+
+// Turn LLM-inferred pairs into edges, with the reason as the connection note.
+function applySemanticRels(artifacts, rels) {
+  const byTitle = new Map(artifacts.map((a) => [a.title.toLowerCase().trim(), a]));
+  for (const a of artifacts) { a.related = []; a.refs = []; a.refBy = []; }
+  const seen = new Set();
+  let edges = 0;
+  for (const l of rels) {
+    const A = byTitle.get((l.a || "").toLowerCase().trim());
+    const B = byTitle.get((l.b || "").toLowerCase().trim());
+    if (!A || !B || A === B) continue;
+    const key = [A.id, B.id].sort().join("|");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    A.related.push(B.id);
+    B.related.push(A.id);
+    A.refs.push({ id: B.id, snippet: l.reason || "" });
+    B.refBy.push({ id: A.id, snippet: l.reason || "" });
+    edges++;
+  }
+  return edges;
 }
 
 // ---------- output writers ----------
@@ -680,9 +771,11 @@ function writeReport(model) {
   };
   const modalSrcs = model.artifacts.map(modalSrc).join("");
   const graph = computeGraphLayout(model.artifacts);
-  const relBlurb = model.relationshipMode === "topics"
-    ? `${model.relationshipCount} topical connections. Your notes don't cross-reference each other, so this maps them by the subjects they share`
-    : `${model.relationshipCount} links your own notes drew between each other`;
+  const relBlurb = model.relationshipMode === "semantic"
+    ? `${model.relationshipCount} relationships inferred from what your notes mean`
+    : model.relationshipMode === "topics"
+      ? `${model.relationshipCount} topical connections. Your notes don't cross-reference each other, so this maps them by the subjects they share`
+      : `${model.relationshipCount} links your own notes drew between each other`;
   // Only worth a graph section when there's a real web to show.
   const showGraph = graph.nodes.length >= 5 && model.relationshipCount >= 4;
   const graphHtml = showGraph
@@ -736,7 +829,10 @@ function writeReport(model) {
   // lead with the few memories so the meta doesn't drown them.
   const stripHtml = small ? `<div class="strip">${ins.surfaced} surfaced · ${ins.durable} worth keeping · ${plural(ins.subjectsOut, "area")}${model.relationshipCount ? ` · ${model.relationshipCount} connected` : ""}${ins.staleCount ? ` · ${ins.staleCount} stale` : ""}</div>` : "";
   const byAreaSection = `<div class="section-title">The intent, by area</div>${searchHtml}${subjectSections}`;
-  const analysisSection = `${small ? "" : `<div class="section-title">What intent-scan did</div><div class="did">${did}</div>`}${graphHtml}${(model.timeline || []).length >= 3 ? timelineHtml : ""}<div class="section-title">What these are, and why they matter</div><div class="legend">${legend}</div>${attn.length ? `<div class="section-title">Worth your attention</div><div class="attn">${attn.join("")}</div>` : ""}`;
+  const personasHtml = model.personas && model.personas.length
+    ? `<div class="section-title">Suggested experts</div><div class="experts">${model.personas.map((p) => `<div class="expert"><div class="expert-n">${esc(p.name)}</div><div class="expert-r">${esc(p.role)}</div>${p.draws_on && p.draws_on.length ? `<div class="expert-d"><b>Built from:</b> ${p.draws_on.slice(0, 6).map((t) => esc(t)).join(", ")}</div>` : ""}${p.questions && p.questions.length ? `<div class="expert-q"><b>Can answer:</b> ${p.questions.slice(0, 3).map((q) => esc(q)).join(" · ")}</div>` : ""}</div>`).join("")}</div>`
+    : "";
+  const analysisSection = `${small ? "" : `<div class="section-title">What intent-scan did</div><div class="did">${did}</div>`}${personasHtml}${graphHtml}${(model.timeline || []).length >= 3 ? timelineHtml : ""}<div class="section-title">What these are, and why they matter</div><div class="legend">${legend}</div>${attn.length ? `<div class="section-title">Worth your attention</div><div class="attn">${attn.join("")}</div>` : ""}`;
   const bodyMain = small ? `${byAreaSection}<hr class="divider">${analysisSection}` : `${analysisSection}<hr class="divider">${byAreaSection}`;
   const secretBanner = model.redacted
     ? `<div class="secnote">Secrets redacted for sharing. Passwords, keys, and tokens have been masked in this copy.</div>`
@@ -766,6 +862,12 @@ h1{font-size:30px;margin:0 0 6px;font-weight:660;letter-spacing:-0.01em}
 .changed{background:#eef4ee;border:1px solid #cfe0cf;border-radius:10px;padding:12px 16px;margin:16px 0;font-size:14px;color:#3d6b3d}
 .changed b{color:#2f5a2f}
 .chg-list{font-size:13px;color:#4a6b4a;margin-top:4px}
+.experts{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
+.expert{background:var(--card);border:1px solid var(--line);border-radius:11px;padding:14px 16px}
+.expert-n{font-size:16px;font-weight:660}
+.expert-r{font-size:13.5px;color:#444;margin:2px 0 8px}
+.expert-d{font-size:12.5px;color:var(--mut);margin-top:4px}.expert-d b{color:#555}
+.expert-q{font-size:12.5px;color:#4a6b4a;margin-top:5px}.expert-q b{color:#3d6b3d}
 .section-title{font-size:13px;font-weight:680;text-transform:uppercase;letter-spacing:.06em;color:var(--accent);margin:40px 0 14px}
 .did{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}
 .did-card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
@@ -963,15 +1065,20 @@ async function scanOnce(useLlm) {
   assignSubjects(artifacts);
   let relationshipMode = "links";
   let relationshipCount = resolveRelationships(artifacts);
-  if (relationshipCount === 0) { relationshipCount = assignTopicalRelationships(artifacts); relationshipMode = "topics"; }
 
-  let conflicts = [];
+  let conflicts = [], personas = [];
   if (useLlm) {
     console.log("  running LLM semantic pass...");
     const r = await llmClassify(artifacts);
     artifacts = r.artifacts;
     conflicts = r.conflicts;
+    personas = r.personas || [];
+    if (relationshipCount === 0 && r.semanticRels && r.semanticRels.length) {
+      relationshipCount = applySemanticRels(artifacts, r.semanticRels);
+      relationshipMode = "semantic";
+    }
   }
+  if (relationshipCount === 0) { relationshipCount = assignTopicalRelationships(artifacts); relationshipMode = "topics"; }
 
   const byKind = {};
   for (const a of artifacts) byKind[a.kind] = (byKind[a.kind] || 0) + 1;
@@ -991,6 +1098,7 @@ async function scanOnce(useLlm) {
     conflicts,
     relationshipCount,
     relationshipMode,
+    personas,
     secretCount,
     redacted: REDACT,
     timeline: computeTimeline(artifacts),
