@@ -40,6 +40,19 @@ Heads up: your notes can contain real credentials (a password or API key you
 told the AI once). The report flags those and, on any project, `--redact` masks
 them so the report is safe to send back.
 
+## Keep it in sync (optional)
+
+So it comes to you instead of you remembering to run it:
+
+```sh
+npx github:benjisnyder/intent-scan . --watch          # re-scan as your memory changes, print what changed
+npx github:benjisnyder/intent-scan . --install-hook    # refresh + show a diff after every git commit
+npx github:benjisnyder/intent-scan . --uninstall-hook  # remove that hook
+```
+
+On the second and later runs, the report opens with a "Since your last scan"
+summary of what was added, changed, or removed.
+
 By default the report and `.intent/` folder are written under `~/.otent/scans/`,
 not into your repo, so nothing is touched unless you pass `--commit`.
 

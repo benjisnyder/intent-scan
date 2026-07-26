@@ -20,6 +20,7 @@ const USE_LLM = args.includes("--llm");
 const AUTO_YES = args.includes("--yes") || args.includes("-y");
 const DO_COMMIT = args.includes("--commit");
 const REDACT = args.includes("--redact");
+const WATCH = args.includes("--watch");
 const projectPath = path.resolve(args.find((a) => !a.startsWith("--")) || process.cwd());
 const projectName = path.basename(projectPath);
 const slug = (s) =>
@@ -742,6 +743,10 @@ function writeReport(model) {
     : model.secretCount
       ? `<div class="secwarn"><b>${model.secretCount} note${model.secretCount > 1 ? "s" : ""} contain${model.secretCount > 1 ? "" : "s"} likely credentials</b> (passwords, API keys, tokens). This report is on your machine, but do not share it as-is. Re-run with <code>--redact</code> for a masked, shareable copy.</div>`
       : "";
+  const d = model.diff;
+  const changeHtml = d && !d.firstRun && (d.added.length || d.changed.length || d.removed.length)
+    ? `<div class="changed"><b>Since your last scan${d.prevAt ? " (" + esc(d.prevAt.slice(0, 10)) + ")" : ""}:</b> ${[d.added.length ? `${d.added.length} new` : "", d.changed.length ? `${d.changed.length} changed` : "", d.removed.length ? `${d.removed.length} removed` : ""].filter(Boolean).join(" · ")}.${d.added.length ? `<div class="chg-list">New: ${d.added.slice(0, 10).map((x) => esc(x.title)).join(", ")}</div>` : ""}${d.changed.length ? `<div class="chg-list">Changed: ${d.changed.slice(0, 10).map((x) => esc(x.title)).join(", ")}</div>` : ""}</div>`
+    : "";
 
   const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Intent · ${esc(model.project)}</title>
@@ -758,6 +763,9 @@ h1{font-size:30px;margin:0 0 6px;font-weight:660;letter-spacing:-0.01em}
 .secwarn b{color:#7a3b28}
 .secnote{background:#eef2f7;border:1px solid #d5dfeb;border-radius:10px;padding:10px 16px;margin:16px 0;font-size:13.5px;color:#3a5d88}
 .secbadge{font-size:11px;font-weight:600;padding:1px 7px;border-radius:5px;text-transform:uppercase;letter-spacing:.03em;background:#f4d9cf;color:#8a3b22}
+.changed{background:#eef4ee;border:1px solid #cfe0cf;border-radius:10px;padding:12px 16px;margin:16px 0;font-size:14px;color:#3d6b3d}
+.changed b{color:#2f5a2f}
+.chg-list{font-size:13px;color:#4a6b4a;margin-top:4px}
 .section-title{font-size:13px;font-weight:680;text-transform:uppercase;letter-spacing:.06em;color:var(--accent);margin:40px 0 14px}
 .did{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}
 .did-card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
@@ -842,6 +850,7 @@ code{font-family:ui-monospace,Menlo,monospace;background:#f0ede6;padding:1px 5px
 <div class="sub">Your project's AI intent, made visible.</div>
 <p class="intro">As you built <b>${esc(model.project)}</b> with AI, it quietly accumulated <b>${ins.surfaced}</b> pieces of "intent": decisions you made, rules you set, and knowledge you taught it. Almost none of it was visible. It lived in Claude Code's local memory, not your repo. Below is what was there, each item cited to the exact file it came from. Click any tile to read the full note.</p>
 ${secretBanner}
+${changeHtml}
 ${stripHtml}
 ${bodyMain}
 
@@ -900,8 +909,150 @@ function openFile(f) {
   exec(`${cmd} "${f}"`, () => {});
 }
 
+// Compare this scan to the previous one (snapshot stored per project) so we can
+// show "what changed since last time", the observe-over-time / retention hook.
+function computeDiff(model, artifacts) {
+  const snapPath = path.join(outDir, "snapshot.json");
+  const hash = (a) => {
+    let h = 5381;
+    const s = a.kind + "|" + (a.summary || "") + "|" + (a.body || "").slice(0, 2000);
+    for (let i = 0; i < s.length; i++) h = (((h << 5) + h) + s.charCodeAt(i)) & 0xffffffff;
+    return h;
+  };
+  const cur = artifacts.map((a) => ({ id: a.id, title: a.title, kind: a.kind, h: hash(a) }));
+  let prev = null;
+  try { prev = JSON.parse(fs.readFileSync(snapPath, "utf8")); } catch {}
+  const diff = { firstRun: !prev, added: [], changed: [], removed: [], prevAt: prev ? prev.at : null };
+  if (prev) {
+    const prevMap = new Map(prev.items.map((i) => [i.id, i]));
+    const curIds = new Set(cur.map((c) => c.id));
+    for (const c of cur) {
+      const p = prevMap.get(c.id);
+      if (!p) diff.added.push({ title: c.title, kind: c.kind });
+      else if (p.h !== c.h) diff.changed.push({ title: c.title, kind: c.kind });
+    }
+    for (const p of prev.items) if (!curIds.has(p.id)) diff.removed.push({ title: p.title, kind: p.kind });
+  }
+  return { diff, snapshot: { at: new Date().toISOString(), items: cur }, snapPath };
+}
+
+function diffSummary(model) {
+  const d = model.diff;
+  if (!d || d.firstRun) return "";
+  const parts = [];
+  if (d.added.length) parts.push(`${d.added.length} new`);
+  if (d.changed.length) parts.push(`${d.changed.length} changed`);
+  if (d.removed.length) parts.push(`${d.removed.length} removed`);
+  return parts.join(", ");
+}
+
+// One scan pass: read, classify, diff, and write outputs. Returns the model.
+async function scanOnce(useLlm) {
+  let artifacts = readMemory();
+  const repoGuidance = readRepoGuidance();
+  if (!artifacts.length) return null;
+
+  let secretCount = 0;
+  for (const a of artifacts) {
+    const found = detectSecrets((a.body || "") + "\n" + (a.summary || ""));
+    a.hasSecret = found.count > 0;
+    if (a.hasSecret) secretCount++;
+    if (REDACT) { a.body = redactText(a.body || ""); a.summary = redactText(a.summary || ""); }
+  }
+
+  assignSubjects(artifacts);
+  let relationshipMode = "links";
+  let relationshipCount = resolveRelationships(artifacts);
+  if (relationshipCount === 0) { relationshipCount = assignTopicalRelationships(artifacts); relationshipMode = "topics"; }
+
+  let conflicts = [];
+  if (useLlm) {
+    console.log("  running LLM semantic pass...");
+    const r = await llmClassify(artifacts);
+    artifacts = r.artifacts;
+    conflicts = r.conflicts;
+  }
+
+  const byKind = {};
+  for (const a of artifacts) byKind[a.kind] = (byKind[a.kind] || 0) + 1;
+  const insights = computeInsights(artifacts, byKind);
+
+  const model = {
+    project: projectName,
+    projectPath,
+    generatedAt: new Date().toISOString(),
+    mode: useLlm ? "llm + heuristic" : "heuristic (deterministic)",
+    sources: [
+      { tool: "claude", kind: "memory", path: memoryDir, fileCount: artifacts.length },
+      ...(repoGuidance.length ? [{ tool: "repo", kind: "agent-guidance", paths: repoGuidance.map((r) => r.rel) }] : []),
+    ],
+    counts: { total: artifacts.length, byKind },
+    insights,
+    conflicts,
+    relationshipCount,
+    relationshipMode,
+    secretCount,
+    redacted: REDACT,
+    timeline: computeTimeline(artifacts),
+    repoGuidance,
+    artifacts,
+  };
+
+  const { diff, snapshot, snapPath } = computeDiff(model, artifacts);
+  model.diff = diff;
+
+  ensureDir(outDir);
+  writeIntentFolder(model);
+  writeProjection(model);
+  writeReport(model);
+  if (DO_COMMIT) fs.cpSync(intentDir, path.join(projectPath, ".intent"), { recursive: true });
+  fs.writeFileSync(snapPath, JSON.stringify(snapshot));
+  return model;
+}
+
+function installHook() {
+  const gitDir = path.join(projectPath, ".git");
+  if (!fs.existsSync(gitDir)) { console.log(`\n  Not a git repository (${projectPath} has no .git). Nothing installed.\n`); return; }
+  const hooksDir = path.join(gitDir, "hooks");
+  ensureDir(hooksDir);
+  const hp = path.join(hooksDir, "post-commit");
+  const marker = "# intent-scan hook";
+  const line = `npx -y github:benjisnyder/intent-scan "$(git rev-parse --show-toplevel)" --yes 2>/dev/null | tail -8`;
+  if (fs.existsSync(hp)) {
+    const cur = fs.readFileSync(hp, "utf8");
+    if (cur.includes(marker)) { console.log("\n  intent-scan hook already installed.\n"); return; }
+    fs.appendFileSync(hp, `\n${marker}\n${line}\n`);
+  } else {
+    fs.writeFileSync(hp, `#!/bin/sh\n${marker}\n${line}\n`);
+  }
+  fs.chmodSync(hp, 0o755);
+  console.log(`\n  Installed a post-commit hook at ${hp}.`);
+  console.log(`  After each commit it refreshes your intent and prints what changed.`);
+  console.log(`  Remove it with:  intent-scan --uninstall-hook\n`);
+}
+
+function uninstallHook() {
+  const hp = path.join(projectPath, ".git", "hooks", "post-commit");
+  if (!fs.existsSync(hp)) { console.log("\n  No post-commit hook here.\n"); return; }
+  const kept = fs.readFileSync(hp, "utf8").split("\n").filter((l) => !l.includes("intent-scan"));
+  const body = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (body === "#!/bin/sh" || body === "") fs.rmSync(hp);
+  else fs.writeFileSync(hp, body + "\n");
+  console.log("\n  Removed the intent-scan post-commit hook.\n");
+}
+
 async function main() {
   loadEnvFile();
+
+  if (args.includes("--uninstall-hook")) { uninstallHook(); return; }
+  if (args.includes("--install-hook")) {
+    console.log(`\n  Otent · intent-scan`);
+    console.log(`  Install a git post-commit hook in ${projectPath}? It re-runs intent-scan and`);
+    console.log(`  prints what changed after each commit, so you don't have to remember to run it.`);
+    if (!(await consent())) { console.log("  Aborted.\n"); return; }
+    installHook();
+    return;
+  }
 
   console.log(`\n  Otent · intent-scan (preview)\n`);
   console.log(`  Project:  ${projectPath}`);
@@ -924,90 +1075,47 @@ async function main() {
     return;
   }
 
-  let artifacts = readMemory();
-  const repoGuidance = readRepoGuidance();
-  console.log(`\n  Found ${artifacts.length} memory artifacts and ${repoGuidance.length} repo guidance file(s).`);
-
-  if (!artifacts.length) {
-    console.log("  Nothing to surface here yet.\n");
+  const model = await scanOnce(USE_LLM);
+  if (!model) {
+    console.log("\n  Nothing to surface here yet.\n");
     return;
   }
-
-  // Flag likely secrets sitting in the notes; redact them when asked.
-  let secretCount = 0;
-  for (const a of artifacts) {
-    const found = detectSecrets((a.body || "") + "\n" + (a.summary || ""));
-    a.hasSecret = found.count > 0;
-    if (a.hasSecret) secretCount++;
-    if (REDACT) { a.body = redactText(a.body || ""); a.summary = redactText(a.summary || ""); }
-  }
-
-  assignSubjects(artifacts); // deterministic clustering; the --llm pass refines it
-  let relationshipMode = "links";
-  let relationshipCount = resolveRelationships(artifacts);
-  if (relationshipCount === 0) { relationshipCount = assignTopicalRelationships(artifacts); relationshipMode = "topics"; }
-
-  let conflicts = [];
-  if (USE_LLM) {
-    console.log("  running LLM semantic pass...");
-    const r = await llmClassify(artifacts);
-    artifacts = r.artifacts;
-    conflicts = r.conflicts;
-  }
-
-  const byKind = {};
-  for (const a of artifacts) byKind[a.kind] = (byKind[a.kind] || 0) + 1;
-
-  const insights = computeInsights(artifacts, byKind);
-
-  const model = {
-    project: projectName,
-    projectPath,
-    generatedAt: new Date().toISOString(),
-    mode: USE_LLM ? "llm + heuristic" : "heuristic (deterministic)",
-    sources: [
-      { tool: "claude", kind: "memory", path: memoryDir, fileCount: artifacts.length },
-      ...(repoGuidance.length ? [{ tool: "repo", kind: "agent-guidance", paths: repoGuidance.map((r) => r.rel) }] : []),
-    ],
-    counts: { total: artifacts.length, byKind },
-    insights,
-    conflicts,
-    relationshipCount,
-    relationshipMode,
-    secretCount,
-    redacted: REDACT,
-    timeline: computeTimeline(artifacts),
-    repoGuidance,
-    artifacts,
-  };
-
-  ensureDir(outDir);
-  writeIntentFolder(model);
-  writeProjection(model);
-  writeReport(model);
 
   const reportPath = path.join(outDir, "report.html");
   const k = model.counts.byKind;
 
+  console.log(`\n  Found ${model.counts.total} memory artifacts.`);
   console.log(`\n  ── What you're looking at ──`);
   console.log(`  ${model.counts.total} pieces of AI intent this project accumulated invisibly, now surfaced:`);
-  console.log(`  ${k.perspective || 0} perspectives · ${k.canon || 0} canon (pinned decisions) · ${k.plan || 0} plans · ${new Set(artifacts.map((a) => a.subject)).size} subjects`);
+  console.log(`  ${k.perspective || 0} perspectives · ${k.canon || 0} canon (pinned decisions) · ${k.plan || 0} plans · ${new Set(model.artifacts.map((a) => a.subject)).size} subjects`);
   console.log(`  Compiled into a portable .intent/ folder, every item cited to its source. Yours, local, nothing uploaded.`);
-  if (secretCount) console.log(`\n  ⚠ ${secretCount} note${secretCount > 1 ? "s" : ""} contain${secretCount > 1 ? "" : "s"} likely credentials (passwords, keys).${REDACT ? " Redacted in this run." : " Add --redact before sharing the report."}`);
-  console.log(`\n  Today this is a one-shot snapshot. The product keeps it in sync as you work,`);
-  console.log(`  lets you curate it (promote, pin, merge, retire), and projects it into your tools.`);
-
-  if (DO_COMMIT) {
-    const dest = path.join(projectPath, ".intent");
-    fs.cpSync(intentDir, dest, { recursive: true });
-    console.log(`\n  Wrote .intent/ into your repo:  ${dest}`);
-  } else {
-    console.log(`\n  Folder (kept out of your repo):  ${intentDir}`);
-    console.log(`  To place it in your repo instead, re-run with:  --commit`);
-  }
+  const ds = diffSummary(model);
+  if (ds) console.log(`\n  Since your last scan: ${ds}.`);
+  if (model.secretCount) console.log(`\n  ⚠ ${model.secretCount} note${model.secretCount > 1 ? "s" : ""} contain${model.secretCount > 1 ? "" : "s"} likely credentials (passwords, keys).${REDACT ? " Redacted in this run." : " Add --redact before sharing the report."}`);
+  if (DO_COMMIT) console.log(`\n  Wrote .intent/ into your repo:  ${path.join(projectPath, ".intent")}`);
+  else console.log(`\n  Folder (kept out of your repo):  ${intentDir}`);
 
   console.log(`\n  Opening the report:  ${reportPath}`);
   openFile(reportPath);
+
+  if (WATCH) {
+    console.log(`\n  Watching for changes... (Ctrl-C to stop). The report regenerates and the`);
+    console.log(`  terminal shows what changed; refresh the browser tab to see updates.\n`);
+    let timer = null;
+    const rerun = () => {
+      clearTimeout(timer);
+      timer = setTimeout(async () => {
+        const m = await scanOnce(false);
+        if (!m) return;
+        const s = diffSummary(m);
+        const extra = m.diff && m.diff.added.length ? "  new: " + m.diff.added.slice(0, 3).map((x) => x.title).join(", ") : "";
+        console.log(`  [rescanned] ${s || "no changes"}${extra}`);
+      }, 400);
+    };
+    try { fs.watch(memoryDir, {}, rerun); } catch {}
+    for (const r of model.repoGuidance) { try { fs.watch(r.path, {}, rerun); } catch {} }
+    return;
+  }
 
   console.log(`\n  Feedback wanted: what surprised you, what is useful, what is junk.`);
   console.log(`  Reply to whoever sent you this. Thank you.\n`);
